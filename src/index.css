@@ -1,0 +1,82 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --color-ink-950: #0b0f17;
+  --color-ink-900: #111723;
+  --color-ink-850: #151c2a;
+  --color-ink-800: #1a2232;
+  --color-ink-700: #263045;
+  --color-ink-600: #364159;
+  --color-ink-500: #55617c;
+  --color-ink-400: #7d89a3;
+  --color-ink-300: #a7b1c6;
+  --color-ink-200: #cfd6e4;
+
+  --color-gene-speed: #ff7a7a;
+  --color-gene-size: #5fe39a;
+  --color-gene-sense: #6aa8ff;
+  --color-food: #b6f36b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-ink-200);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  width: 100%;
+  height: 18px;
+  cursor: pointer;
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--track-fill, #6aa8ff) 0%,
+    var(--track-fill, #6aa8ff) var(--fill, 50%),
+    var(--color-ink-700) var(--fill, 50%)
+  );
+}
+input[type='range']::-moz-range-track {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--color-ink-700);
+}
+input[type='range']::-moz-range-progress {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--track-fill, #6aa8ff);
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -5px;
+  border-radius: 999px;
+  background: #e8edf6;
+  border: 2px solid var(--color-ink-900);
+  box-shadow: 0 0 0 1px var(--track-fill, #6aa8ff);
+}
+input[type='range']::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: #e8edf6;
+  border: 2px solid var(--color-ink-900);
+}
