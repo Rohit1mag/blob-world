@@ -2,12 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArenaCanvas } from './components/ArenaCanvas';
 import { ChartsPanel } from './components/ChartsPanel';
 import { ControlsBar, type LiveParams, type SpeedSetting } from './components/ControlsBar';
+import { useAnimationFrame } from './components/useAnimationFrame';
 import { PRESETS } from './engine/config';
 import { SimulationEngine } from './engine/SimulationEngine';
 import type { DayStatus } from './engine/types';
 
 /** Simulation ticks per second at 1×. */
 const BASE_TPS = 60;
+/** Hard ceiling on simulation work per rendered frame, at any speed. */
+const MAX_TICKS_PER_FRAME = 50;
 /** Per-frame CPU budget for the Max setting, leaving headroom for rendering. */
 const MAX_FRAME_BUDGET_MS = 11;
 
@@ -40,51 +43,47 @@ export default function App() {
     setStatus(engine.getStatus());
   }, [engine]);
 
-  // Fixed-timestep driver: simulation rate is decoupled from frame rate, so Max
-  // runs as many deterministic ticks as fit in the frame budget.
-  useEffect(() => {
-    let raf = 0;
-    let last = performance.now();
-    let acc = 0;
-    let lastStatusAt = 0;
-    let lastChartAt = 0;
-    let lastRevision = engine.revision;
+  // Fixed-timestep driver: simulation rate is decoupled from frame rate, and the
+  // loop is suspended entirely while the tab is hidden.
+  const loop = useRef({ acc: 0, lastStatusAt: 0, lastChartAt: 0, lastRevision: engine.revision });
+  useAnimationFrame((now, rawDt) => {
+    const l = loop.current;
+    const dt = Math.min(100, rawDt);
+    const s = speedRef.current;
 
-    const frame = (now: number) => {
-      raf = requestAnimationFrame(frame);
-      const dt = Math.min(100, now - last);
-      last = now;
-      const s = speedRef.current;
-
-      if (playingRef.current) {
-        if (s === 'max') {
-          const deadline = now + MAX_FRAME_BUDGET_MS;
-          do engine.runTicks(50);
-          while (performance.now() < deadline && engine.phase !== 'extinct');
-        } else {
-          acc += (dt / 1000) * BASE_TPS * s;
-          const n = Math.floor(acc);
-          acc -= n;
-          engine.runTicks(Math.min(n, s * 8));
+    if (playingRef.current) {
+      if (s === 'max') {
+        const deadline = now + MAX_FRAME_BUDGET_MS;
+        for (let done = 0; done < MAX_TICKS_PER_FRAME && engine.phase !== 'extinct'; done += 10) {
+          engine.runTicks(10);
+          if (performance.now() > deadline) break;
         }
-        if (engine.phase === 'extinct') setPlaying(false);
       } else {
-        acc = 0;
+        l.acc += (dt / 1000) * BASE_TPS * s;
+        const n = Math.floor(l.acc);
+        l.acc -= n;
+        engine.runTicks(Math.min(n, MAX_TICKS_PER_FRAME));
       }
+      if (engine.phase === 'extinct') setPlaying(false);
+    } else {
+      l.acc = 0;
+    }
 
-      const chartInterval = s === 'max' ? 120 : 0;
-      if (engine.revision !== lastRevision && now - lastChartAt >= chartInterval) {
-        lastRevision = engine.revision;
-        lastChartAt = now;
-        setRevision(engine.revision);
-      }
-      if (now - lastStatusAt > 100) {
-        lastStatusAt = now;
-        setStatus(engine.getStatus());
-      }
-    };
-    raf = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(raf);
+    const chartInterval = s === 'max' ? 120 : 0;
+    if (engine.revision !== l.lastRevision && now - l.lastChartAt >= chartInterval) {
+      l.lastRevision = engine.revision;
+      l.lastChartAt = now;
+      setRevision(engine.revision);
+    }
+    if (now - l.lastStatusAt > 100) {
+      l.lastStatusAt = now;
+      setStatus(engine.getStatus());
+    }
+  });
+
+  const [pinnedId, setPinnedId] = useState<number | null>(null);
+  const selectFittest = useCallback(() => {
+    setPinnedId(engine.fittestBlob()?.id ?? null);
   }, [engine]);
 
   const togglePlay = useCallback(() => {
@@ -135,11 +134,13 @@ export default function App() {
         stepDay();
       } else if (e.key === 'r' || e.key === 'R') {
         reset();
+      } else if (e.key === 'f' || e.key === 'F') {
+        selectFittest();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [togglePlay, stepDay, reset]);
+  }, [togglePlay, stepDay, reset, selectFittest]);
 
   const pending = {
     foodPerDay: params.foodPerDay !== engine.config.foodPerDay,
@@ -161,7 +162,7 @@ export default function App() {
         <div className="flex items-center gap-4 text-[10.5px] text-ink-500">
           <span className="flex items-center gap-3">
             <span>Color =</span>
-            <span className="text-gene-speed">R speed</span>
+            <span className="text-gene-speed">R max speed</span>
             <span className="text-gene-size">G size</span>
             <span className="text-gene-sense">B sense</span>
           </span>
@@ -182,13 +183,14 @@ export default function App() {
         onParam={setParam}
         onPreset={applyPreset}
         onReset={reset}
+        onSelectFittest={selectFittest}
       />
 
       <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_460px]">
         <section className="flex min-h-[420px] flex-col rounded-xl border border-ink-700/60 bg-ink-900/40 p-3">
           <DayProgress status={status} />
           <div className="relative mt-3 min-h-0 flex-1">
-            <ArenaCanvas engine={engine} />
+            <ArenaCanvas engine={engine} pinnedId={pinnedId} onPinnedChange={setPinnedId} />
             {status.phase === 'extinct' && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <div className="rounded-xl border border-ink-600/70 bg-ink-900/90 px-6 py-5 text-center shadow-2xl backdrop-blur">
@@ -212,7 +214,7 @@ export default function App() {
             <span className="flex items-center gap-1.5">
               <span className="h-0.5 w-4 bg-ink-400" /> home perimeter
             </span>
-            <span>Eat 1 → survive · eat 2 → replicate · eat 0 → die</span>
+            <span>Brains steer · touch the border with food to get home · 1 food → survive · 2 → replicate</span>
             <span>Predation: ≥ 1.2× larger eats smaller</span>
             <span className="ml-auto">Hover or click a blob to inspect · Space play · → step · R reset</span>
           </footer>

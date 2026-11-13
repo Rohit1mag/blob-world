@@ -10,6 +10,11 @@ export const DEFAULT_CONFIG: SimulationConfig = {
   initialPopulation: 30,
   initialVariance: 0.0,
 
+  brainMutationProb: 0.3,
+  brainMutationScale: 2.5,
+  maxTurn: 0.3,
+  minPopulation: 20,
+
   startEnergy: 100,
   baseVelocity: 2.5,
   baseRadius: 8,
@@ -22,7 +27,7 @@ export const DEFAULT_CONFIG: SimulationConfig = {
   preyFoodValue: 2,
   preyEnergyGain: 40,
 
-  maxDayTicks: 2400,
+  maxDayTicks: 1000,
   duskTicks: 50,
   maxPopulation: 600,
 };
@@ -44,8 +49,8 @@ export const PRESETS: ScenarioPreset[] = [
   {
     id: 'famine',
     name: 'Famine',
-    description: 'Scarce food. Only the most energy-efficient foragers make it home.',
-    config: { foodPerDay: 22, mutationRate: 0.08, initialPopulation: 40, initialVariance: 0 },
+    description: 'Scarce food. Brains take longer to learn, and only efficient foragers make it home.',
+    config: { foodPerDay: 30, mutationRate: 0.08, initialPopulation: 40, initialVariance: 0 },
   },
   {
     id: 'arms-race',

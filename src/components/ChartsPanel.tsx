@@ -8,6 +8,10 @@ const SIZE = '#5fe39a';
 const SENSE = '#6aa8ff';
 const POP = '#e8edf6';
 const FOOD = '#b6f36b';
+const HOME = '#5eead4';
+/** Mean home-survival rate, sustained over a trailing window, at which homing counts as "learned". */
+const EMERGENCE_THRESHOLD = 0.5;
+const EMERGENCE_WINDOW = 5;
 
 interface ChartsPanelProps {
   history: GenerationStats[];
@@ -66,7 +70,7 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
     ];
     const pct = (v: number) => `${v.toFixed(2)}×`;
     const traits: Series[] = [
-      { id: 'speed', label: 'Speed', color: SPEED, values: history.map((h) => h.avgSpeed / GENE_RANGES.speed.default), format: pct },
+      { id: 'speed', label: 'Max speed', color: SPEED, values: history.map((h) => h.avgSpeed / GENE_RANGES.maxSpeed.default), format: pct },
       { id: 'size', label: 'Size', color: SIZE, values: history.map((h) => h.avgSize / GENE_RANGES.size.default), format: pct },
       {
         id: 'sense',
@@ -76,13 +80,42 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
         format: pct,
       },
     ];
-    const scatter = genes.map((g) => ({ x: g.speed, y: g.size, color: blobColors(g).fill }));
+    // Day 0 is the untested founding population, so behaviour series start at day 1.
+    const days = history.slice(1);
+    const behaviour: Series[] = [
+      {
+        id: 'home',
+        label: 'Home survival',
+        color: HOME,
+        values: days.map((h) => h.homeRate),
+        area: true,
+        format: (v) => `${Math.round(v * 100)}%`,
+      },
+      {
+        id: 'avgFood',
+        label: 'Food / blob',
+        color: FOOD,
+        values: days.map((h) => h.avgFood),
+        format: (v) => v.toFixed(2),
+      },
+    ];
+    const emergenceIdx = days.findIndex((_, i) => {
+      if (i < EMERGENCE_WINDOW - 1) return false;
+      let sum = 0;
+      for (let k = i - EMERGENCE_WINDOW + 1; k <= i; k++) sum += days[k].homeRate;
+      return sum / EMERGENCE_WINDOW >= EMERGENCE_THRESHOLD;
+    });
+    const scatter = genes.map((g) => ({ x: g.maxSpeed, y: g.size, color: blobColors(g).fill }));
     return {
       xs,
       population,
       traits,
+      behaviourXs: days.map((h) => h.day),
+      behaviour,
+      emergenceDay: emergenceIdx >= 0 ? days[emergenceIdx].day : null,
+      backfilledTotal: days.reduce((s, h) => s + h.backfilled, 0),
       scatter,
-      speeds: genes.map((g) => g.speed),
+      speeds: genes.map((g) => g.maxSpeed),
       sizes: genes.map((g) => g.size),
       senses: genes.map((g) => g.senseRadius),
     };
@@ -94,7 +127,7 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid grid-cols-4 gap-2 rounded-xl border border-ink-700/60 bg-ink-900/70 px-4 py-3">
+      <div className="grid grid-cols-5 gap-2 rounded-xl border border-ink-700/60 bg-ink-900/70 px-4 py-3">
         <Stat label="Day" value={day} />
         <Stat
           label="Population"
@@ -110,9 +143,45 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
             </>
           }
         />
+        <Stat label="Home %" value={last && last.day > 0 ? `${Math.round(last.homeRate * 100)}` : '–'} tone={HOME} />
         <Stat label="Born" value={last?.born ?? 0} tone="#8be3b0" />
         <Stat label="Died" value={last ? `${last.starved + last.eaten}` : 0} tone="#f19aa6" />
       </div>
+
+      <Card
+        title="Behavioral emergence"
+        subtitle={
+          derived.emergenceDay !== null
+            ? `Population learned to forage and return home by day ${derived.emergenceDay}`
+            : 'Waiting for the population to learn to come home…'
+        }
+        legend={
+          <>
+            <LegendItem
+              color={HOME}
+              label="Home %"
+              value={last && last.day > 0 ? `${Math.round(last.homeRate * 100)}%` : undefined}
+            />
+            <LegendItem color={FOOD} label="Food/blob" value={last && last.day > 0 ? last.avgFood.toFixed(2) : undefined} />
+          </>
+        }
+      >
+        <LineChart
+          xs={derived.behaviourXs}
+          series={derived.behaviour}
+          height={120}
+          yMin={0}
+          yMax={1}
+          xLabel="day"
+          markers={
+            derived.emergenceDay !== null ? [{ x: derived.emergenceDay, label: 'learned', color: HOME }] : undefined
+          }
+        />
+        <p className="mt-1 text-[9.5px] text-ink-500">
+          Home % = share of the day's blobs that ate and touched the border alive. Seeded from the fittest when below
+          the population floor: {derived.backfilledTotal} so far.
+        </p>
+      </Card>
 
       <Card
         title="Population over generations"
@@ -132,7 +201,7 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
         subtitle="Population mean, relative to the founding default (1.0×)"
         legend={
           <>
-            <LegendItem color={SPEED} label="Speed" value={last ? last.avgSpeed.toFixed(2) : undefined} />
+            <LegendItem color={SPEED} label="Max speed" value={last ? last.avgSpeed.toFixed(2) : undefined} />
             <LegendItem color={SIZE} label="Size" value={last ? last.avgSize.toFixed(2) : undefined} />
             <LegendItem color={SENSE} label="Sense" value={last ? last.avgSense.toFixed(0) : undefined} />
           </>
@@ -151,15 +220,15 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
       <Card title="Trait distribution" subtitle={`Generation alive on day ${day} · n = ${genes.length}`}>
         <div className="grid grid-cols-3 gap-3">
           <Histogram
-            label={<span style={{ color: SPEED }}>Speed</span>}
+            label={<span style={{ color: SPEED }}>Max speed</span>}
             values={derived.speeds}
-            min={GENE_RANGES.speed.min}
-            max={GENE_RANGES.speed.max}
+            min={GENE_RANGES.maxSpeed.min}
+            max={GENE_RANGES.maxSpeed.max}
             bins={18}
             color={SPEED}
             height={52}
             format={(v) => v.toFixed(1)}
-            reference={GENE_RANGES.speed.default}
+            reference={GENE_RANGES.maxSpeed.default}
           />
           <Histogram
             label={<span style={{ color: SIZE }}>Size</span>}
@@ -186,17 +255,17 @@ export const ChartsPanel = memo(function ChartsPanel({ history, genes, day, revi
         </div>
         <div className="mt-3">
           <div className="mb-1 flex items-baseline justify-between text-[10px]">
-            <span className="font-medium text-ink-300">Speed × Size</span>
+            <span className="font-medium text-ink-300">Max speed × Size</span>
             <span className="text-ink-500">clusters here are diverging species</span>
           </div>
           <ScatterPlot
             points={derived.scatter}
-            xRange={[GENE_RANGES.speed.min, GENE_RANGES.speed.max]}
+            xRange={[GENE_RANGES.maxSpeed.min, GENE_RANGES.maxSpeed.max]}
             yRange={[GENE_RANGES.size.min, GENE_RANGES.size.max]}
             height={128}
-            xLabel="speed"
+            xLabel="max speed"
             yLabel="size"
-            reference={[GENE_RANGES.speed.default, GENE_RANGES.size.default]}
+            reference={[GENE_RANGES.maxSpeed.default, GENE_RANGES.size.default]}
           />
         </div>
       </Card>

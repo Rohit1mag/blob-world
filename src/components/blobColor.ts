@@ -8,12 +8,12 @@ function channel(base: number, delta: number): number {
 }
 
 /**
- * R = speed, G = size, B = sense radius, each measured as log-ratio from the default
+ * R = max speed, G = size, B = sense radius, each measured as log-ratio from the default
  * so the founding population reads as steel blue and drift in any trait shifts the hue.
  */
 export function blobRGB(g: Genes): [number, number, number] {
   return [
-    channel(0.35, Math.log(g.speed / GENE_RANGES.speed.default) * 1.1),
+    channel(0.35, Math.log(g.maxSpeed / GENE_RANGES.maxSpeed.default) * 1.1),
     channel(0.5, Math.log(g.size / GENE_RANGES.size.default) * 1.3),
     channel(0.78, Math.log(g.senseRadius / GENE_RANGES.senseRadius.default) * 0.8),
   ];

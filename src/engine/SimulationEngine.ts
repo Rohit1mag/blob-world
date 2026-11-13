@@ -1,4 +1,5 @@
 import { DEFAULT_CONFIG } from './config';
+import { NN_INPUTS, NeuralNet } from './NeuralNet';
 import { Random } from './random';
 import { SpatialGrid } from './SpatialGrid';
 import {
@@ -15,12 +16,15 @@ import {
 
 const GRID_CELL = 50;
 const FOOD_RADIUS = 4;
-const TURN_RATE = 0.28;
-const WANDER_JITTER = 0.14;
-const WALL_AVOID_DIST = 45;
-const RETURN_SAFETY = 1.15;
-const RETURN_BUFFER = 1.5;
 const HOME_EPSILON = 1.5;
+const INV_PI = 1 / Math.PI;
+/**
+ * Backfill fitness for blobs that didn't make it home. Only the first pellet counts, so a
+ * population where nobody returns isn't selected toward greedy foraging, and fed blobs are
+ * rewarded for how close they got to the border.
+ */
+const FED_FOOD_SCORE = 15;
+const HOMING_SHAPING = 20;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -32,14 +36,15 @@ function wrapAngle(a: number): number {
   return a;
 }
 
-export function energyDrain(genes: Genes, cfg: SimulationConfig): number {
-  const { size, speed, senseRadius } = genes;
-  return size * size * size * speed * speed * cfg.cMove + senseRadius * cfg.cSense + cfg.cBase;
+/** Energy per tick at a given actual speed (`maxSpeed × throttle`). */
+export function energyDrain(genes: Genes, currentSpeed: number, cfg: SimulationConfig): number {
+  const { size, senseRadius } = genes;
+  return size * size * size * currentSpeed * currentSpeed * cfg.cMove + senseRadius * cfg.cSense + cfg.cBase;
 }
 
 export function clampGenes(g: Genes): Genes {
   return {
-    speed: clamp(g.speed, GENE_RANGES.speed.min, GENE_RANGES.speed.max),
+    maxSpeed: clamp(g.maxSpeed, GENE_RANGES.maxSpeed.min, GENE_RANGES.maxSpeed.max),
     size: clamp(g.size, GENE_RANGES.size.min, GENE_RANGES.size.max),
     senseRadius: clamp(g.senseRadius, GENE_RANGES.senseRadius.min, GENE_RANGES.senseRadius.max),
   };
@@ -47,7 +52,7 @@ export function clampGenes(g: Genes): Genes {
 
 /**
  * Headless, deterministic simulation. Has no knowledge of React or rendering:
- * callers advance it with `tick()` at whatever rate they like and read state directly.
+ * callers advance it with `step()` at whatever rate they like and read state directly.
  */
 export class SimulationEngine {
   config: SimulationConfig;
@@ -70,6 +75,8 @@ export class SimulationEngine {
   private nextBlobId = 1;
   private nextFoodId = 1;
   private foodRemaining = 0;
+  private dayPopulation = 0;
+  private readonly inputs = new Float32Array(NN_INPUTS);
 
   private blobGrid: SpatialGrid<Blob>;
   private foodGrid: SpatialGrid<Food>;
@@ -82,7 +89,7 @@ export class SimulationEngine {
     this.reset();
   }
 
-  /** Restart from day 1 with a fresh founding population. */
+  /** Restart from day 1 with a fresh founding population of random brains. */
   reset(config: Partial<SimulationConfig> = {}): void {
     this.config = { ...this.config, ...(this.pendingConfig ?? {}), ...config };
     this.pendingConfig = null;
@@ -100,16 +107,25 @@ export class SimulationEngine {
     const v = this.config.initialVariance;
     for (let i = 0; i < this.config.initialPopulation; i++) {
       const genes = clampGenes({
-        speed: GENE_RANGES.speed.default * (1 + v * this.rng.gaussian()),
+        maxSpeed: GENE_RANGES.maxSpeed.default * (1 + v * this.rng.gaussian()),
         size: GENE_RANGES.size.default * (1 + v * this.rng.gaussian()),
         senseRadius: GENE_RANGES.senseRadius.default * (1 + v * this.rng.gaussian()),
       });
-      const blob = this.createBlob(genes, null, 0);
-      blob.lineageId = blob.id;
-      this.blobs.push(blob);
+      this.blobs.push(this.createBlob(genes, NeuralNet.random(this.rng), null, 0));
     }
 
-    this.history.push(this.computeStats(this.blobs, 0, { survived: 0, replicated: 0, starved: 0, eaten: 0, born: 0 }));
+    this.history.push(
+      this.computeStats(this.blobs, 0, {
+        survived: 0,
+        replicated: 0,
+        starved: 0,
+        eaten: 0,
+        born: 0,
+        homeRate: 0,
+        avgFood: 0,
+        backfilled: 0,
+      }),
+    );
     this.startDay();
   }
 
@@ -134,8 +150,8 @@ export class SimulationEngine {
     for (const b of this.blobs) {
       if (b.outcome === 'newborn') continue;
       if (b.state === 'home') home++;
-      else if (b.state === 'starved' || b.state === 'eaten') dead++;
-      else active++;
+      else if (b.state === 'active') active++;
+      else dead++;
     }
     return {
       day: this.day,
@@ -148,6 +164,29 @@ export class SimulationEngine {
       foodRemaining: this.foodRemaining,
       foodTotal: this.food.length,
     };
+  }
+
+  /** Live score used by "Select Fittest": food dominates, energy breaks ties. */
+  liveFitness(b: Blob): number {
+    return b.foodEaten * 10 + b.kills * 5 + (b.energy / b.maxEnergy) * 2;
+  }
+
+  /** Highest-scoring blob still moving, falling back to the best survivor. */
+  fittestBlob(): Blob | null {
+    let best: Blob | null = null;
+    let bestScore = -Infinity;
+    for (const pass of ['active', 'home'] as const) {
+      for (const b of this.blobs) {
+        if (b.state !== pass || b.outcome === 'newborn') continue;
+        const s = this.liveFitness(b);
+        if (s > bestScore) {
+          bestScore = s;
+          best = b;
+        }
+      }
+      if (best) return best;
+    }
+    return null;
   }
 
   /** Advance one fixed simulation step. */
@@ -168,13 +207,13 @@ export class SimulationEngine {
   /** Run until the next day has begun (or the population is extinct). */
   advanceDay(): void {
     const target = this.day + 1;
-    const guard = this.config.maxDayTicks + this.config.duskTicks + 10;
-    for (let i = 0; i < guard * 2 && this.day < target && this.phase !== 'extinct'; i++) this.step();
+    const guard = (this.config.maxDayTicks + this.config.duskTicks + 10) * 2;
+    for (let i = 0; i < guard && this.day < target && this.phase !== 'extinct'; i++) this.step();
   }
 
   // ───────────────────────────── Day lifecycle ─────────────────────────────
 
-  private createBlob(genes: Genes, parent: Blob | null, generation: number): Blob {
+  private createBlob(genes: Genes, brain: NeuralNet, parent: Blob | null, generation: number): Blob {
     const id = this.nextBlobId++;
     return {
       id,
@@ -182,23 +221,46 @@ export class SimulationEngine {
       parentId: parent ? parent.id : null,
       generation,
       genes,
+      brain,
       x: parent ? parent.x : 0,
       y: parent ? parent.y : 0,
-      heading: 0,
+      angle: parent ? parent.angle : 0,
+      velocity: 0,
+      throttle: 0,
+      turn: 0,
       radius: genes.size * this.config.baseRadius,
       energy: this.config.startEnergy,
       maxEnergy: this.config.startEnergy,
-      drain: energyDrain(genes, this.config),
       foodEaten: 0,
       kills: 0,
       daysSurvived: 0,
+      spawnX: 0,
+      spawnY: 0,
+      maxDisplacement: 0,
+      closestEdgeFed: this.config.arenaSize / 2,
+      seesFood: false,
+      foodX: 0,
+      foodY: 0,
+      seesThreat: false,
+      threatX: 0,
+      threatY: 0,
+      seesPrey: false,
+      preyX: 0,
+      preyY: 0,
       state: 'home',
-      mode: 'idle',
-      targetX: 0,
-      targetY: 0,
       outcome: 'pending',
       settledTick: 0,
     };
+  }
+
+  private perimeterPoint(t: number): [number, number] {
+    const L = this.config.arenaSize;
+    const side = Math.floor(t / L) % 4;
+    const s = t - Math.floor(t / L) * L;
+    if (side === 0) return [s, 0];
+    if (side === 1) return [L, s];
+    if (side === 2) return [L - s, L];
+    return [0, L - s];
   }
 
   private startDay(): void {
@@ -209,9 +271,7 @@ export class SimulationEngine {
     const cfg = this.config;
     const L = cfg.arenaSize;
 
-    this.blobs = this.blobs.filter(
-      (b) => b.outcome === 'pending' || b.outcome === 'survived' || b.outcome === 'replicated' || b.outcome === 'newborn',
-    );
+    this.blobs = this.blobs.filter((b) => b.outcome !== 'died');
     if (this.blobs.length === 0) {
       this.phase = 'extinct';
       this.revision++;
@@ -230,27 +290,26 @@ export class SimulationEngine {
     const n = this.blobs.length;
     for (let i = 0; i < n; i++) {
       const b = this.blobs[i];
-      const t = (((i + offset) / n) * perimeter) % perimeter;
-      const side = Math.floor(t / L);
-      const s = t - side * L;
-      if (side === 0) { b.x = s; b.y = 0; }
-      else if (side === 1) { b.x = L; b.y = s; }
-      else if (side === 2) { b.x = L - s; b.y = L; }
-      else { b.x = 0; b.y = L - s; }
-      b.heading = Math.atan2(L / 2 - b.y, L / 2 - b.x) + this.rng.range(-0.6, 0.6);
+      const [x, y] = this.perimeterPoint((((i + offset) / n) * perimeter) % perimeter);
+      b.x = b.spawnX = x;
+      b.y = b.spawnY = y;
+      b.angle = Math.atan2(L / 2 - y, L / 2 - x) + this.rng.range(-0.6, 0.6);
+      b.velocity = 0;
+      b.throttle = 0;
+      b.turn = 0;
       b.radius = b.genes.size * cfg.baseRadius;
-      b.drain = energyDrain(b.genes, cfg);
       b.energy = cfg.startEnergy;
       b.maxEnergy = cfg.startEnergy;
       b.foodEaten = 0;
       b.kills = 0;
-      b.state = 'foraging';
-      b.mode = 'wander';
-      b.targetX = b.x;
-      b.targetY = b.y;
+      b.maxDisplacement = 0;
+      b.closestEdgeFed = L / 2;
+      b.seesFood = b.seesThreat = b.seesPrey = false;
+      b.state = 'active';
       b.outcome = 'pending';
       b.settledTick = 0;
     }
+    this.dayPopulation = n;
     this.generationGenes = this.blobs.map((b) => b.genes);
 
     this.food = [];
@@ -266,16 +325,28 @@ export class SimulationEngine {
     this.revision++;
   }
 
+  /** End-of-day score for ranking backfill parents; rewards progress even in failure. */
+  private dayFitness(b: Blob): number {
+    const L = this.config.arenaSize;
+    if (b.state === 'home') return 100 + 20 * b.foodEaten;
+    let score = FED_FOOD_SCORE * Math.min(b.foodEaten, 1) + 5 * (b.maxDisplacement / L);
+    if (b.foodEaten > 0) score += HOMING_SHAPING * (1 - b.closestEdgeFed / (L / 2));
+    return score;
+  }
+
   private endDay(): void {
     const cfg = this.config;
     const L = cfg.arenaSize;
     let survived = 0;
     let replicated = 0;
-    const offspring: Blob[] = [];
+    let totalFood = 0;
     const nextGen: Blob[] = [];
+    const fitness = new Map<Blob, number>();
 
     for (const b of this.blobs) {
-      if (b.state === 'home' && b.foodEaten >= 1) {
+      totalFood += b.foodEaten;
+      fitness.set(b, this.dayFitness(b));
+      if (b.state === 'home') {
         b.daysSurvived++;
         nextGen.push(b);
         if (b.foodEaten >= 2) {
@@ -287,30 +358,12 @@ export class SimulationEngine {
         }
       } else {
         b.outcome = 'died';
-        if (b.state === 'home' || b.state === 'foraging' || b.state === 'returning') {
+        if (b.state === 'active') {
           b.state = 'starved';
           b.settledTick = this.tick;
         }
       }
     }
-
-    let room = cfg.maxPopulation - nextGen.length;
-    for (const parent of this.blobs) {
-      if (parent.outcome !== 'replicated' || room <= 0) continue;
-      room--;
-      const child = this.createBlob(this.mutate(parent.genes), parent, parent.generation + 1);
-      // Place the child beside its parent along the home edge.
-      const along = parent.radius + child.radius + 2;
-      const onVertical = parent.x <= HOME_EPSILON || parent.x >= L - HOME_EPSILON;
-      child.x = clamp(parent.x + (onVertical ? 0 : along), 0, L);
-      child.y = clamp(parent.y + (onVertical ? along : 0), 0, L);
-      child.heading = parent.heading;
-      child.outcome = 'newborn';
-      child.settledTick = this.tick;
-      offspring.push(child);
-    }
-    this.blobs.push(...offspring);
-    nextGen.push(...offspring);
 
     let starved = 0;
     let eaten = 0;
@@ -319,15 +372,76 @@ export class SimulationEngine {
       if (b.state === 'eaten') eaten++;
       else starved++;
     }
+
+    const offspring: Blob[] = [];
+    let room = cfg.maxPopulation - nextGen.length;
+    for (const parent of this.blobs) {
+      if (parent.outcome !== 'replicated' || room <= 0) continue;
+      room--;
+      const child = this.spawnChild(parent);
+      // Place the child beside its parent along the home edge.
+      const along = parent.radius + child.radius + 2;
+      const onVertical = parent.x <= HOME_EPSILON || parent.x >= L - HOME_EPSILON;
+      child.x = clamp(parent.x + (onVertical ? 0 : along), 0, L);
+      child.y = clamp(parent.y + (onVertical ? along : 0), 0, L);
+      offspring.push(child);
+    }
+
+    // Population floor: refill from the day's fittest via tournament selection.
+    const backfill: Blob[] = [];
+    const deficit = cfg.minPopulation - (nextGen.length + offspring.length);
+    if (deficit > 0) {
+      const ranked = [...this.blobs].sort((a, b) => fitness.get(b)! - fitness.get(a)!);
+      const pool = ranked.slice(0, Math.max(2, Math.ceil(ranked.length * 0.25)));
+      for (let i = 0; i < deficit; i++) {
+        const a = pool[Math.floor(this.rng.next() * pool.length)];
+        const c = pool[Math.floor(this.rng.next() * pool.length)];
+        const parent = fitness.get(a)! >= fitness.get(c)! ? a : c;
+        const child = this.spawnChild(parent);
+        const [x, y] = this.perimeterPoint(this.rng.next() * 4 * L);
+        child.x = x;
+        child.y = y;
+        backfill.push(child);
+      }
+    }
+
+    this.blobs.push(...offspring, ...backfill);
+    nextGen.push(...offspring, ...backfill);
+
+    const pop = Math.max(1, this.dayPopulation);
     this.history.push(
-      this.computeStats(nextGen, this.day, { survived, replicated, starved, eaten, born: offspring.length }),
+      this.computeStats(nextGen, this.day, {
+        survived,
+        replicated,
+        starved,
+        eaten,
+        born: offspring.length,
+        homeRate: (survived + replicated) / pop,
+        avgFood: totalFood / pop,
+        backfilled: backfill.length,
+      }),
     );
     this.phase = 'dusk';
     this.duskCounter = 0;
     this.revision++;
   }
 
-  private mutate(g: Genes): Genes {
+  private spawnChild(parent: Blob): Blob {
+    const cfg = this.config;
+    const strength = cfg.mutationRate * cfg.brainMutationScale;
+    const prob = cfg.mutationRate > 0 ? cfg.brainMutationProb : 0;
+    const child = this.createBlob(
+      this.mutateGenes(parent.genes),
+      parent.brain.cloneAndMutate(prob, strength, this.rng),
+      parent,
+      parent.generation + 1,
+    );
+    child.outcome = 'newborn';
+    child.settledTick = this.tick;
+    return child;
+  }
+
+  private mutateGenes(g: Genes): Genes {
     const m = this.config.mutationRate;
     const out = {} as Genes;
     for (const key of Object.keys(g) as GeneKey[]) {
@@ -339,13 +453,16 @@ export class SimulationEngine {
   private computeStats(
     pop: Blob[],
     day: number,
-    counts: Pick<GenerationStats, 'survived' | 'replicated' | 'starved' | 'eaten' | 'born'>,
+    counts: Pick<
+      GenerationStats,
+      'survived' | 'replicated' | 'starved' | 'eaten' | 'born' | 'homeRate' | 'avgFood' | 'backfilled'
+    >,
   ): GenerationStats {
     const n = pop.length;
     const mean = (k: GeneKey) => (n ? pop.reduce((s, b) => s + b.genes[k], 0) / n : 0);
     const sd = (k: GeneKey, mu: number) =>
       n ? Math.sqrt(pop.reduce((s, b) => s + (b.genes[k] - mu) ** 2, 0) / n) : 0;
-    const avgSpeed = mean('speed');
+    const avgSpeed = mean('maxSpeed');
     const avgSize = mean('size');
     const avgSense = mean('senseRadius');
     return {
@@ -355,7 +472,7 @@ export class SimulationEngine {
       avgSpeed,
       avgSize,
       avgSense,
-      sdSpeed: sd('speed', avgSpeed),
+      sdSpeed: sd('maxSpeed', avgSpeed),
       sdSize: sd('size', avgSize),
       sdSense: sd('senseRadius', avgSense),
       ...counts,
@@ -371,66 +488,117 @@ export class SimulationEngine {
 
     this.blobGrid.clear();
     for (const b of this.blobs) {
-      if (b.state === 'foraging' || b.state === 'returning') this.blobGrid.insert(b);
+      if (b.state === 'active') this.blobGrid.insert(b);
     }
 
     for (const b of this.blobs) {
-      if (b.state !== 'foraging' && b.state !== 'returning') continue;
+      if (b.state !== 'active') continue;
 
-      b.energy -= b.drain;
+      this.sense(b);
+      const out = b.brain.forward(this.inputs);
+      b.turn = out[0] * cfg.maxTurn;
+      b.throttle = (out[1] + 1) * 0.5;
+      b.angle = wrapAngle(b.angle + b.turn);
+
+      const currentSpeed = b.genes.maxSpeed * b.throttle;
+      b.velocity = currentSpeed * cfg.baseVelocity;
+      b.energy -= energyDrain(b.genes, currentSpeed, cfg);
       if (b.energy <= 0) {
         b.energy = 0;
         this.kill(b, 'starved');
         continue;
       }
 
-      const distEdge = Math.min(b.x, L - b.x, b.y, L - b.y);
-      const velocity = b.genes.speed * cfg.baseVelocity;
-
-      if (b.state === 'foraging') {
-        if (b.foodEaten >= 2) {
-          b.state = 'returning';
-        } else if (b.foodEaten >= 1) {
-          const ticksHome = distEdge / velocity;
-          if (b.energy <= ticksHome * b.drain * RETURN_SAFETY + RETURN_BUFFER) b.state = 'returning';
-        }
-      }
-
-      if (b.state === 'returning') this.steerHome(b);
-      else this.steerForage(b, velocity);
-
-      b.x = clamp(b.x + Math.cos(b.heading) * velocity, 0, L);
-      b.y = clamp(b.y + Math.sin(b.heading) * velocity, 0, L);
-
-      if (b.state === 'returning') {
-        if (Math.min(b.x, L - b.x, b.y, L - b.y) <= HOME_EPSILON) {
-          this.snapToEdge(b);
-          b.state = 'home';
-          b.mode = 'idle';
-          b.settledTick = this.tick;
-        }
-        continue;
-      }
+      b.x = clamp(b.x + Math.cos(b.angle) * b.velocity, 0, L);
+      b.y = clamp(b.y + Math.sin(b.angle) * b.velocity, 0, L);
+      const disp = Math.hypot(b.x - b.spawnX, b.y - b.spawnY);
+      if (disp > b.maxDisplacement) b.maxDisplacement = disp;
 
       this.tryEat(b);
+
+      const distEdge = Math.min(b.x, L - b.x, b.y, L - b.y);
+      if (b.foodEaten > 0 && distEdge < b.closestEdgeFed) b.closestEdgeFed = distEdge;
+      if (b.foodEaten > 0 && distEdge <= HOME_EPSILON) {
+        b.state = 'home';
+        b.velocity = 0;
+        b.settledTick = this.tick;
+      }
     }
 
     this.checkDayEnd();
   }
 
-  private kill(b: Blob, how: 'starved' | 'eaten'): void {
-    b.state = how;
-    b.mode = 'idle';
-    b.settledTick = this.tick;
+  /** Fill `this.inputs` with the 8 normalised senses for blob `b`. */
+  private sense(b: Blob): void {
+    const cfg = this.config;
+    const sense = b.genes.senseRadius;
+    const ratio = cfg.predationRatio;
+    const inp = this.inputs;
+
+    const food = this.foodGrid.nearest(b.x, b.y, sense, (f) => !f.eaten);
+    b.seesFood = food !== null;
+    if (food) {
+      b.foodX = food.x;
+      b.foodY = food.y;
+      const d = Math.hypot(food.x - b.x, food.y - b.y);
+      inp[0] = wrapAngle(Math.atan2(food.y - b.y, food.x - b.x) - b.angle) * INV_PI;
+      inp[1] = 1 - Math.min(1, d / sense);
+    } else {
+      inp[0] = 0;
+      inp[1] = 0;
+    }
+
+    let threat: Blob | null = null;
+    let threatD2 = Infinity;
+    let prey: Blob | null = null;
+    let preyD2 = Infinity;
+    if (cfg.predationEnabled) {
+      this.blobGrid.query(b.x, b.y, sense, (o, d2) => {
+        if (o === b || o.state !== 'active') return;
+        if (o.genes.size >= b.genes.size * ratio) {
+          if (d2 < threatD2) {
+            threat = o;
+            threatD2 = d2;
+          }
+        } else if (b.genes.size >= o.genes.size * ratio && d2 < preyD2) {
+          prey = o;
+          preyD2 = d2;
+        }
+      });
+    }
+
+    const t = threat as Blob | null;
+    b.seesThreat = t !== null;
+    if (t) {
+      b.threatX = t.x;
+      b.threatY = t.y;
+      inp[2] = wrapAngle(Math.atan2(t.y - b.y, t.x - b.x) - b.angle) * INV_PI;
+      inp[3] = 1 - Math.min(1, Math.sqrt(threatD2) / sense);
+    } else {
+      inp[2] = 0;
+      inp[3] = 0;
+    }
+
+    const p = prey as Blob | null;
+    b.seesPrey = p !== null;
+    if (p) {
+      b.preyX = p.x;
+      b.preyY = p.y;
+      inp[4] = wrapAngle(Math.atan2(p.y - b.y, p.x - b.x) - b.angle) * INV_PI;
+    } else {
+      inp[4] = 0;
+    }
+
+    const [hx, hy] = this.nearestEdgePoint(b);
+    inp[5] = hx === b.x && hy === b.y ? 0 : wrapAngle(Math.atan2(hy - b.y, hx - b.x) - b.angle) * INV_PI;
+    inp[6] = clamp(b.energy / b.maxEnergy, 0, 1);
+    inp[7] = b.foodEaten >= 2 ? 1 : 0;
   }
 
-  private turnToward(b: Blob, angle: number, instant: boolean): void {
-    if (instant) {
-      b.heading = angle;
-      return;
-    }
-    const diff = wrapAngle(angle - b.heading);
-    b.heading = wrapAngle(b.heading + clamp(diff, -TURN_RATE, TURN_RATE));
+  private kill(b: Blob, how: 'starved' | 'eaten'): void {
+    b.state = how;
+    b.velocity = 0;
+    b.settledTick = this.tick;
   }
 
   private nearestEdgePoint(b: Blob): [number, number] {
@@ -446,122 +614,18 @@ export class SimulationEngine {
     return [b.x, L];
   }
 
-  private snapToEdge(b: Blob): void {
-    const [x, y] = this.nearestEdgePoint(b);
-    b.x = x;
-    b.y = y;
-  }
-
-  private steerHome(b: Blob): void {
-    const [tx, ty] = this.nearestEdgePoint(b);
-    b.mode = 'home';
-    b.targetX = tx;
-    b.targetY = ty;
-    this.turnToward(b, Math.atan2(ty - b.y, tx - b.x), true);
-  }
-
-  private steerForage(b: Blob, velocity: number): void {
-    const cfg = this.config;
-    const L = cfg.arenaSize;
-    const sense = b.genes.senseRadius;
-    const ratio = cfg.predationRatio;
-
-    let fleeX = 0;
-    let fleeY = 0;
-    let threatened = false;
-    let prey: Blob | null = null;
-    let preyD2 = Infinity;
-
-    if (cfg.predationEnabled) {
-      this.blobGrid.query(b.x, b.y, sense, (o, d2) => {
-        if (o === b || (o.state !== 'foraging' && o.state !== 'returning')) return;
-        if (o.genes.size >= b.genes.size * ratio) {
-          const d = Math.sqrt(d2) || 1;
-          fleeX += (b.x - o.x) / (d * d);
-          fleeY += (b.y - o.y) / (d * d);
-          threatened = true;
-        } else if (b.genes.size >= o.genes.size * ratio && d2 < preyD2) {
-          prey = o;
-          preyD2 = d2;
-        }
-      });
-    }
-
-    if (threatened) {
-      // A blob that already has a meal heads for safety rather than running blind.
-      if (b.foodEaten >= 1) {
-        b.state = 'returning';
-        this.steerHome(b);
-        return;
-      }
-      b.mode = 'flee';
-      b.targetX = b.x + fleeX * 4000;
-      b.targetY = b.y + fleeY * 4000;
-      let ang = Math.atan2(fleeY, fleeX);
-      const nearWall = Math.min(b.x, L - b.x, b.y, L - b.y) < WALL_AVOID_DIST;
-      if (nearWall) {
-        // Slide along the wall instead of pinning against it.
-        const toCenter = Math.atan2(L / 2 - b.y, L / 2 - b.x);
-        ang = Math.atan2(Math.sin(ang) + Math.sin(toCenter) * 0.6, Math.cos(ang) + Math.cos(toCenter) * 0.6);
-      }
-      this.turnToward(b, ang, false);
-      return;
-    }
-
-    const food = this.foodGrid.nearest(b.x, b.y, sense, (f) => !f.eaten);
-    let tx = 0;
-    let ty = 0;
-    let targetD2 = Infinity;
-    if (food) {
-      targetD2 = (food.x - b.x) ** 2 + (food.y - b.y) ** 2;
-      tx = food.x;
-      ty = food.y;
-      b.mode = 'food';
-    }
-    // Prey is worth more than a pellet, so it wins unless it is much further away.
-    const p = prey as Blob | null;
-    if (p && preyD2 / (cfg.preyFoodValue * cfg.preyFoodValue) < targetD2) {
-      targetD2 = preyD2;
-      tx = p.x;
-      ty = p.y;
-      b.mode = 'hunt';
-    }
-
-    if (targetD2 < Infinity) {
-      b.targetX = tx;
-      b.targetY = ty;
-      const close = targetD2 < (velocity * 5) ** 2;
-      this.turnToward(b, Math.atan2(ty - b.y, tx - b.x), close);
-      return;
-    }
-
-    b.mode = 'wander';
-    let ang = b.heading + this.rng.gaussian() * WANDER_JITTER;
-    const distEdge = Math.min(b.x, L - b.x, b.y, L - b.y);
-    if (distEdge < WALL_AVOID_DIST + b.radius) {
-      const toCenter = Math.atan2(L / 2 - b.y, L / 2 - b.x);
-      this.turnToward(b, toCenter + this.rng.range(-0.8, 0.8), false);
-    } else {
-      b.heading = wrapAngle(ang);
-    }
-    b.targetX = b.x + Math.cos(b.heading) * Math.min(sense, 60);
-    b.targetY = b.y + Math.sin(b.heading) * Math.min(sense, 60);
-  }
-
   private tryEat(b: Blob): void {
     const cfg = this.config;
-    const reach = b.radius + FOOD_RADIUS;
-    this.foodGrid.query(b.x, b.y, reach, (f) => {
+    this.foodGrid.query(b.x, b.y, b.radius + FOOD_RADIUS, (f) => {
       if (f.eaten) return;
       f.eaten = true;
       this.foodRemaining--;
       b.foodEaten++;
-      return b.foodEaten >= 2;
     });
 
     if (cfg.predationEnabled) {
       this.blobGrid.query(b.x, b.y, b.radius, (o) => {
-        if (o === b || (o.state !== 'foraging' && o.state !== 'returning')) return;
+        if (o === b || o.state !== 'active') return;
         if (b.genes.size < o.genes.size * cfg.predationRatio) return;
         this.kill(o, 'eaten');
         b.foodEaten += cfg.preyFoodValue;
@@ -570,37 +634,24 @@ export class SimulationEngine {
         return true;
       });
     }
-
-    if (b.foodEaten >= 2) b.state = 'returning';
   }
 
   private checkDayEnd(): void {
     let active = 0;
-    let fed = 0;
-    for (const b of this.blobs) {
-      if (b.state === 'foraging' || b.state === 'returning') {
-        active++;
-        if (b.foodEaten > 0) fed++;
-      }
-    }
+    for (const b of this.blobs) if (b.state === 'active') active++;
 
-    if (active > 0 && this.foodRemaining === 0) {
-      // Field is empty: anyone with a meal heads home; the unfed can only win by predation.
+    // With the field empty and no predation possible, unfed blobs are already doomed.
+    if (active > 0 && this.foodRemaining === 0 && !this.anyPredationPossible()) {
       for (const b of this.blobs) {
-        if (b.state === 'foraging' && b.foodEaten > 0) b.state = 'returning';
-      }
-      if (fed === 0 && !this.anyPredationPossible()) {
-        for (const b of this.blobs) {
-          if (b.state === 'foraging' || b.state === 'returning') this.kill(b, 'starved');
+        if (b.state === 'active' && b.foodEaten === 0) {
+          this.kill(b, 'starved');
+          active--;
         }
-        active = 0;
       }
     }
 
     if (active > 0 && this.tick >= this.config.maxDayTicks) {
-      for (const b of this.blobs) {
-        if (b.state === 'foraging' || b.state === 'returning') this.kill(b, 'starved');
-      }
+      for (const b of this.blobs) if (b.state === 'active') this.kill(b, 'starved');
       active = 0;
     }
 
@@ -609,14 +660,13 @@ export class SimulationEngine {
 
   private anyPredationPossible(): boolean {
     if (!this.config.predationEnabled) return false;
-    const r = this.config.predationRatio;
     let minSize = Infinity;
     let maxSize = 0;
     for (const b of this.blobs) {
-      if (b.state !== 'foraging') continue;
+      if (b.state !== 'active') continue;
       if (b.genes.size < minSize) minSize = b.genes.size;
       if (b.genes.size > maxSize) maxSize = b.genes.size;
     }
-    return maxSize >= minSize * r;
+    return maxSize >= minSize * this.config.predationRatio;
   }
 }

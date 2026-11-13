@@ -24,6 +24,7 @@ interface ControlsBarProps {
   onParam: <K extends keyof LiveParams>(key: K, value: LiveParams[K]) => void;
   onPreset: (id: string) => void;
   onReset: () => void;
+  onSelectFittest: () => void;
 }
 
 function IconButton({
@@ -113,6 +114,7 @@ export function ControlsBar({
   onParam,
   onPreset,
   onReset,
+  onSelectFittest,
 }: ControlsBarProps) {
   return (
     <div className="flex flex-wrap items-center gap-x-6 gap-y-3 rounded-xl border border-ink-700/60 bg-ink-900/70 px-4 py-3">
@@ -155,6 +157,18 @@ export function ControlsBar({
             </button>
           ))}
         </div>
+        <button
+          type="button"
+          onClick={onSelectFittest}
+          title="Pin the highest-scoring active blob and show its brain (F)"
+          className="ml-1 flex items-center gap-1.5 rounded-full border border-[#5eead4]/40 px-3 py-1 text-[11px] font-medium text-[#5eead4] transition hover:border-[#5eead4]/80 hover:bg-[#5eead4]/10"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4">
+            <circle cx="6" cy="6" r="4.2" />
+            <circle cx="6" cy="6" r="1.4" fill="currentColor" />
+          </svg>
+          Select Fittest
+        </button>
       </div>
 
       <div className="flex min-w-[320px] flex-[2] flex-wrap gap-x-5 gap-y-2">

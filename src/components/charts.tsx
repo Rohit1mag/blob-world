@@ -83,13 +83,26 @@ interface LineChartProps {
   height: number;
   yMin?: number;
   baseline?: number;
+  yMax?: number;
   yFormat?: (v: number) => string;
   xLabel?: string;
+  /** Vertical annotations at specific x values. */
+  markers?: { x: number; label: string; color: string }[];
 }
 
 const M = { l: 34, r: 10, t: 10, b: 22 };
 
-export function LineChart({ xs, series, height, yMin, baseline, yFormat = (v) => String(v), xLabel }: LineChartProps) {
+export function LineChart({
+  xs,
+  series,
+  height,
+  yMin,
+  yMax,
+  baseline,
+  yFormat = (v) => String(v),
+  xLabel,
+  markers,
+}: LineChartProps) {
   const [ref, { width }] = useElementSize<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
   const n = xs.length;
@@ -110,6 +123,7 @@ export function LineChart({ xs, series, height, yMin, baseline, yFormat = (v) =>
       hi = Math.max(hi, baseline);
     }
     if (yMin !== undefined) lo = yMin;
+    if (yMax !== undefined) hi = Math.max(hi, yMax);
     if (!isFinite(lo)) {
       lo = 0;
       hi = 1;
@@ -136,7 +150,7 @@ export function LineChart({ xs, series, height, yMin, baseline, yFormat = (v) =>
       (t) => t >= x0 && t <= x1 && Number.isInteger(t),
     );
     return { yTicks, xTicks, sx, sy, paths };
-  }, [xs, series, n, innerW, innerH, yMin, baseline]);
+  }, [xs, series, n, innerW, innerH, yMin, yMax, baseline]);
 
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
     if (n === 0) return;
@@ -197,6 +211,24 @@ export function LineChart({ xs, series, height, yMin, baseline, yFormat = (v) =>
               strokeDasharray="3 4"
             />
           )}
+          {markers?.map((mk) => {
+            const x = geom.sx(mk.x);
+            const anchorEnd = x > width * 0.7;
+            return (
+              <g key={`${mk.label}-${mk.x}`} pointerEvents="none">
+                <line x1={x} x2={x} y1={M.t} y2={M.t + innerH} stroke={mk.color} strokeOpacity={0.7} strokeDasharray="2 3" />
+                <text
+                  x={anchorEnd ? x - 4 : x + 4}
+                  y={M.t + 8}
+                  textAnchor={anchorEnd ? 'end' : 'start'}
+                  className="font-mono text-[9px]"
+                  fill={mk.color}
+                >
+                  {mk.label}
+                </text>
+              </g>
+            );
+          })}
           {geom.paths.map((p, i) => (
             <g key={p.id}>
               {p.area && <path d={p.area} fill={`url(#${gradId(p.id)})`} />}

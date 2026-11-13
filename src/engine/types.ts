@@ -1,5 +1,8 @@
+import type { NeuralNet } from './NeuralNet';
+
 export interface Genes {
-  speed: number;
+  /** Top speed; actual velocity each tick is `maxSpeed × throttle` chosen by the brain. */
+  maxSpeed: number;
   size: number;
   senseRadius: number;
 }
@@ -13,16 +16,16 @@ export interface GeneRange {
 }
 
 export const GENE_RANGES: Record<GeneKey, GeneRange> = {
-  speed: { min: 0.3, max: 3.0, default: 1.0 },
+  maxSpeed: { min: 0.3, max: 3.0, default: 1.0 },
   size: { min: 0.5, max: 2.5, default: 1.0 },
   senseRadius: { min: 20, max: 250, default: 80 },
 };
 
-/** Lifecycle of a blob within a single day. */
-export type BlobState = 'foraging' | 'returning' | 'home' | 'starved' | 'eaten';
-
-/** What the steering system is currently doing; used for rendering the target line. */
-export type SteerMode = 'wander' | 'food' | 'hunt' | 'flee' | 'home' | 'idle';
+/**
+ * Lifecycle within a single day. Movement is entirely brain-driven while `active`;
+ * touching the perimeter with at least one food in hand makes a blob `home` (safe).
+ */
+export type BlobState = 'active' | 'home' | 'starved' | 'eaten';
 
 /** Verdict assigned at end of day; `newborn` marks offspring created during dusk. */
 export type DayOutcome = 'pending' | 'died' | 'survived' | 'replicated' | 'newborn';
@@ -33,24 +36,42 @@ export interface Blob {
   parentId: number | null;
   generation: number;
   genes: Genes;
+  brain: NeuralNet;
 
   x: number;
   y: number;
-  heading: number;
+  angle: number;
+  /** World units moved on the last tick. */
+  velocity: number;
+  /** Last brain outputs, already mapped: throttle in [0, 1], turn in radians/tick. */
+  throttle: number;
+  turn: number;
   radius: number;
 
   energy: number;
   maxEnergy: number;
-  /** Energy spent per tick, derived from genes once per day. */
-  drain: number;
   foodEaten: number;
   kills: number;
   daysSurvived: number;
+  spawnX: number;
+  spawnY: number;
+  /** Furthest distance from today's spawn point, used for fitness shaping. */
+  maxDisplacement: number;
+  /** Closest the blob got to the perimeter after eating, used for fitness shaping. */
+  closestEdgeFed: number;
+
+  /** What the brain perceived on its last tick (for the inspector overlay). */
+  seesFood: boolean;
+  foodX: number;
+  foodY: number;
+  seesThreat: boolean;
+  threatX: number;
+  threatY: number;
+  seesPrey: boolean;
+  preyX: number;
+  preyY: number;
 
   state: BlobState;
-  mode: SteerMode;
-  targetX: number;
-  targetY: number;
   outcome: DayOutcome;
   /** Tick on which the blob's state last changed to a terminal state (home/starved/eaten). */
   settledTick: number;
@@ -75,6 +96,17 @@ export interface SimulationConfig {
   initialPopulation: number;
   /** Std-dev (fractional) of trait variation in the founding population. */
   initialVariance: number;
+
+  /** Probability that each synapse is nudged when a brain is copied (if mutation > 0). */
+  brainMutationProb: number;
+  /** Brain mutation σ = `mutationRate × brainMutationScale`. */
+  brainMutationScale: number;
+  maxTurn: number;
+  /**
+   * If fewer blobs than this survive a day, the gap is refilled with mutated copies of the
+   * day's fittest blobs, so a clumsy random Generation 0 can't immediately go extinct.
+   */
+  minPopulation: number;
 
   startEnergy: number;
   /** World units travelled per tick at speed = 1.0. */
@@ -111,6 +143,12 @@ export interface GenerationStats {
   starved: number;
   eaten: number;
   born: number;
+  /** Fraction (0–1) of the day's population that made it home with food. */
+  homeRate: number;
+  /** Mean food eaten per blob that started the day. */
+  avgFood: number;
+  /** Blobs added by the `minPopulation` floor rather than by replication. */
+  backfilled: number;
   dayTicks: number;
 }
 
