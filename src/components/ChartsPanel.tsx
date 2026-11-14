@@ -27,6 +27,8 @@ const EVENT_ICON = {
   peace: '🕊',
   festival: '★',
   road: '═',
+  invention: '✦',
+  culture: '❖',
 } as const;
 
 interface ChartsPanelProps {
@@ -369,8 +371,8 @@ export const ChartsPanel = memo(function ChartsPanel({
         legend={
           <>
             <LegendItem color={RESOURCE_COLORS.food} label="Food" value={last ? String(Math.round(last.stockpile.food)) : undefined} />
-            <LegendItem color={RESOURCE_COLORS.timber} label="Wood" value={last ? String(last.stockpile.timber) : undefined} />
-            <LegendItem color={RESOURCE_COLORS.stone} label="Stone" value={last ? String(last.stockpile.stone) : undefined} />
+            <LegendItem color={RESOURCE_COLORS.timber} label="Wood" value={last ? String(Math.floor(last.stockpile.timber)) : undefined} />
+            <LegendItem color={RESOURCE_COLORS.stone} label="Stone" value={last ? String(Math.floor(last.stockpile.stone)) : undefined} />
           </>
         }
       >
@@ -535,8 +537,8 @@ function TribeRow({
         <span className="text-ink-500">/{t.housing}</span>
       </span>
       <span className={`text-right text-ink-300 ${dim}`}>{Math.floor(t.stockpile.food)}</span>
-      <span className={`text-right text-ink-300 ${dim}`}>{t.stockpile.timber}</span>
-      <span className={`text-right text-ink-300 ${dim}`}>{t.stockpile.stone}</span>
+      <span className={`text-right text-ink-300 ${dim}`}>{Math.floor(t.stockpile.timber)}</span>
+      <span className={`text-right text-ink-300 ${dim}`}>{Math.floor(t.stockpile.stone)}</span>
     </>
   );
 }

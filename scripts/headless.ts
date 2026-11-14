@@ -45,10 +45,10 @@ for (const preset of PRESETS) {
           ` survival [${rates.map((r) => `${Math.round(r * 100)}%`).join(' ')}]`,
       );
     }
-    const counts = { split: 0, wanderers: 0, fell: 0, realm: 0, vassal: 0, rebel: 0, trade: 0, alliance: 0, war: 0, peace: 0, festival: 0, road: 0 };
+    const counts = { split: 0, wanderers: 0, fell: 0, realm: 0, vassal: 0, rebel: 0, trade: 0, alliance: 0, war: 0, peace: 0, festival: 0, road: 0, invention: 0, culture: 0 };
     for (const e of engine.events) counts[e.kind]++;
     console.log(
-      `  events: ${counts.split} splits, ${counts.wanderers} wanderers, ${counts.fell} falls, ${counts.realm} realms, ${counts.vassal} vassals, ${counts.rebel} rebels, ${counts.trade} trade, ${counts.alliance} alliances, ${counts.war} war, ${counts.peace} peace, ${counts.festival} festivals (last ${engine.events.length})`,
+      `  events: ${counts.split} splits, ${counts.wanderers} wanderers, ${counts.fell} falls, ${counts.realm} realms, ${counts.vassal} vassals, ${counts.rebel} rebels, ${counts.trade} trade, ${counts.alliance} alliances, ${counts.war} war, ${counts.peace} peace, ${counts.festival} festivals, ${counts.invention} inventions, ${counts.culture} culture shifts (last ${engine.events.length})`,
     );
     if (verbose) for (const e of engine.events) console.log(`    d${e.day} ${e.text}`);
   }

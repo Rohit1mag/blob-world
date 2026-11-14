@@ -7,7 +7,7 @@ import { ControlsBar, type LiveParams, type SpeedSetting } from './components/Co
 import { useAnimationFrame } from './components/useAnimationFrame';
 import { PRESETS } from './engine/config';
 import { SimulationEngine, type SavedSimulation } from './engine/SimulationEngine';
-import type { DayStatus } from './engine/types';
+import type { DayStatus, WorldEvent } from './engine/types';
 import { supabaseConfigured } from './lib/supabase';
 import {
   createWorld,
@@ -532,6 +532,7 @@ export default function App() {
                   })}
               </div>
             )}
+            <DiscoveryCard engine={engine} day={status.day} onFocus={focusCamp} />
             {(status.phase === 'extinct' || status.phase === 'won') && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <div className="min-w-[280px] rounded-xl border border-ink-600/70 bg-ink-900/90 px-6 py-5 text-center shadow-2xl backdrop-blur">
@@ -593,6 +594,43 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+/** Headline for the newest invention or culture shift, shown for a couple of days. */
+function DiscoveryCard({ engine, day, onFocus }: { engine: SimulationEngine; day: number; onFocus: (tribeId: number) => void }) {
+  let latest: WorldEvent | null = null;
+  for (let i = engine.events.length - 1; i >= 0; i--) {
+    const e = engine.events[i];
+    if (day - e.day > 2) break;
+    if (e.kind === 'invention' || e.kind === 'culture') {
+      latest = e;
+      break;
+    }
+  }
+  if (!latest) return null;
+  const t = engine.tribes[latest.tribeId];
+  const [headline, detail] = latest.kind === 'invention' ? splitDetail(latest.text) : [latest.text, null];
+  return (
+    <button
+      key={`${latest.day}-${latest.text}`}
+      type="button"
+      onClick={() => onFocus(latest.tribeId)}
+      className="absolute top-2 left-1/2 z-20 max-w-[420px] -translate-x-1/2 rounded-xl border bg-ink-900/90 px-4 py-2 text-center shadow-2xl backdrop-blur"
+      style={{ borderColor: t?.color ?? '#c8d0df' }}
+      title="Jump camera to camp"
+    >
+      <div className="text-[9.5px] font-medium tracking-wider uppercase" style={{ color: t?.color }}>
+        {latest.kind === 'invention' ? '✦ Discovery' : '❖ Culture shift'} · day {latest.day}
+      </div>
+      <div className="text-[13px] font-semibold text-ink-200">{headline}</div>
+      {detail && <div className="text-[10.5px] text-ink-400">{detail}</div>}
+    </button>
+  );
+}
+
+function splitDetail(text: string): [string, string | null] {
+  const open = text.lastIndexOf(' (');
+  return open > 0 && text.endsWith(')') ? [text.slice(0, open), text.slice(open + 2, -1)] : [text, null];
 }
 
 function EndSummary({ status }: { status: DayStatus }) {

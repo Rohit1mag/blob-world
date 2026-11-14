@@ -1,4 +1,25 @@
 import { BASE_LAYOUTS, DEFAULT_CONFIG, MODE_SETTINGS, STRUCTURE_SPECS, TRIBE_TEMPLATES } from './config';
+import {
+  CULTURE_BASELINE,
+  DOMAINS,
+  STYLE_OF_TRAIT,
+  TRAITS,
+  DEVOTED_SHARE,
+  computeMods,
+  createInvention,
+  describeEffects,
+  dominantTrait,
+  driftCulture,
+  emptyPressures,
+  ethosOf,
+  ethosTraits,
+  inheritCulture,
+  normalizeCulture,
+  randomCulture,
+  relativePressures,
+  traitSignals,
+  withArticle,
+} from './culture';
 import { BRAIN_SHAPE, NeuralNet } from './NeuralNet';
 import { Random } from './random';
 import { SpatialGrid } from './SpatialGrid';
@@ -19,6 +40,9 @@ import {
   type RealmTier,
   type ResourceNode,
   type ResourceType,
+  type ArchStyle,
+  type CultureTrait,
+  type Pressures,
   type RiverSegment,
   type Road,
   type Season,
@@ -116,6 +140,36 @@ const JOB_INDEX: Record<BlobJob, number> = {
   scout: 19,
 };
 const ROMAN = ['', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X'];
+/** Research needed for the first invention; each later one costs `INSIGHT_STEP` more. */
+const INSIGHT_BASE = 14;
+const INSIGHT_STEP = 7;
+const ETHOS_MIN_DAYS = 15;
+const ETHOS_KIN_DAYS = 45;
+/** Extra buildings a culture allows of the kinds it cares about. */
+const CULTURE_LIMIT_BONUS: Record<CultureTrait, Partial<Record<StructureType, number>>> = {
+  martial: { barricade: 3, watchtower: 1 },
+  commerce: { market: 1, dock: 1 },
+  faith: { monument: 1 },
+  craft: { workshop: 1, factory: 1 },
+};
+/** Buildings a culture puts first once its homes and granary are covered. */
+const CULTURE_FAVORS: Record<CultureTrait, StructureType[]> = {
+  martial: ['barricade', 'watchtower'],
+  commerce: ['market', 'dock'],
+  faith: ['monument', 'palace'],
+  craft: ['workshop', 'factory', 'lab'],
+};
+
+interface DayTally {
+  starved: number;
+  disease: number;
+  completed: number;
+  festival: boolean;
+}
+
+function emptyTally(): DayTally {
+  return { starved: 0, disease: 0, completed: 0, festival: false };
+}
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -187,7 +241,7 @@ export class SimulationEngine {
   towerShots: { x1: number; y1: number; x2: number; y2: number; tick: number; color: string }[] = [];
   /** Transient visual effects (clashes, splashes, sparks, popups, fireworks). */
   visualFx: {
-    kind: 'clash' | 'splash' | 'spark' | 'popup' | 'firework';
+    kind: 'clash' | 'splash' | 'spark' | 'popup' | 'firework' | 'invention';
     x: number;
     y: number;
     tx?: number;
@@ -230,6 +284,8 @@ export class SimulationEngine {
   private dayDeaths: Record<DeathCause, number> = { starved: 0, exhausted: 0, slain: 0, disease: 0, age: 0 };
   /** Last day each tribe was attacked; drives barricade construction. */
   private lastRaided: number[] = [];
+  /** Per-tribe happenings since dawn that shape culture and research. */
+  private tally: DayTally[] = [];
   private dayFounded = 0;
   private lastWandererDay = -999;
   /** Rebuilt every tick so per-blob checks don't scan every structure in the world. */
@@ -283,6 +339,7 @@ export class SimulationEngine {
     this.directorFocus = null;
     this.scoutedSites = [];
     this.lastRaided = [];
+    this.tally = [];
     this.hallOfFame = [];
     this.lastWandererDay = -999;
 
@@ -363,7 +420,8 @@ export class SimulationEngine {
   carryCapacityFor(tribeId: number): number {
     const hasWorkshop = this.structures.some((s) => s.tribeId === tribeId && s.type === 'workshop' && s.built);
     const hasFactory = this.structures.some((s) => s.tribeId === tribeId && s.type === 'factory' && s.built);
-    return this.config.carryCapacity + (hasWorkshop ? 1 : 0) + (hasFactory ? 2 : 0);
+    const fromInventions = Math.floor(this.tribes[tribeId]?.mods.carry ?? 0);
+    return this.config.carryCapacity + (hasWorkshop ? 1 : 0) + (hasFactory ? 2 : 0) + fromInventions;
   }
 
   getStatus(): DayStatus {
@@ -516,7 +574,24 @@ export class SimulationEngine {
       buildTicks: spec.buildTicks,
       occupants: 0,
       lastHitTick: -999,
+      style: this.tribes[tribeId] ? this.styleOf(this.tribes[tribeId]) : undefined,
     };
+  }
+
+  styleOf(tribe: Tribe): ArchStyle {
+    return STYLE_OF_TRAIT[dominantTrait(tribe.culture)];
+  }
+
+  /** Finish a blueprint: farms get a plot, docks get a fish shoal. */
+  private completeStructure(s: Structure): void {
+    s.built = true;
+    if (this.tally[s.tribeId]) this.tally[s.tribeId].completed++;
+    if (s.type === 'farm') this.ensureFarmNode(s);
+    if (s.type === 'dock') {
+      const rv = this.distToRiver(s.x, s.y);
+      const fish = this.addNode('food', rv.px, rv.py, 7, 9);
+      fish.isFish = true;
+    }
   }
 
   private generateMap(): void {
@@ -737,6 +812,10 @@ export class SimulationEngine {
       ? template.color
       : (TRIBE_TEMPLATES.find((t) => !livingColors.has(t.color))?.color ?? template.color);
     const realmId = origin === 'split' && parentId !== null ? this.tribes[parentId].realmId : this.realms.length;
+    const parent = parentId !== null ? this.tribes[parentId] : undefined;
+    const culture = parent ? inheritCulture(parent.culture, this.rng) : randomCulture(this.rng);
+    // Splinter groups carry their founders' know-how with them.
+    const inventions = origin === 'split' && parent ? parent.inventions.map((inv) => ({ ...inv, effects: { ...inv.effects } })) : [];
     const tribe: Tribe = {
       id,
       name: generation > 0 ? `${template.name} ${ROMAN[generation] ?? generation + 1}` : template.name,
@@ -756,6 +835,13 @@ export class SimulationEngine {
       territory: BASE_TERRITORY,
       conquests: 0,
       deliveredToday: emptyStock(),
+      culture,
+      ethos: ethosOf(culture),
+      ethosDay: this.day,
+      inventions,
+      insight: 0,
+      pressure: emptyPressures(),
+      mods: computeMods(inventions),
     };
     if (origin !== 'split' || parentId === null) {
       this.realms.push({
@@ -769,6 +855,7 @@ export class SimulationEngine {
     }
     this.tribes.push(tribe);
     this.lastRaided.push(-999);
+    this.tally.push(emptyTally());
 
     // A new camp clears away whatever ruin stood on the spot.
     this.structures = this.structures.filter(
@@ -988,6 +1075,7 @@ export class SimulationEngine {
     const t = this.tribes[tribeId];
     if (!t || t.extinct) return;
     t.loyalty = clamp(t.loyalty + 0.15, 0, 1);
+    if (this.tally[tribeId]) this.tally[tribeId].festival = true;
     for (const b of this.blobs) {
       if (b.tribeId === tribeId && b.state === 'active') b.energy = b.maxEnergy;
     }
@@ -1158,6 +1246,7 @@ export class SimulationEngine {
       if (this.structures.some((s) => s.tribeId === t.id && s.type === 'monument' && s.built)) delta += 0.02;
       if (this.structures.some((s) => s.tribeId === cap.id && s.type === 'monument' && s.built)) delta += 0.01;
       if (this.structures.some((s) => s.tribeId === cap.id && s.type === 'palace' && s.built)) delta += 0.015;
+      delta += (t.mods.loyalty ?? 0) + (t.culture.faith - CULTURE_BASELINE) * 0.02;
       t.loyalty = clamp(t.loyalty + delta, 0, 1);
 
       if (t.loyalty <= 0.15 && this.day - t.foundedDay > 15) {
@@ -1243,9 +1332,10 @@ export class SimulationEngine {
         if (t.extinct) continue;
         const pop = pops[t.id];
         if (this.settlementTier(pop) === 'camp') continue;
-        if (t.stockpile.food > pop * cfg.ration * 14 && this.rng.next() < 0.08) {
+        if (t.stockpile.food > pop * cfg.ration * 14 && this.rng.next() < 0.08 * (1 + t.culture.faith * 3)) {
           t.stockpile.food -= pop * cfg.ration * 1.2;
           t.loyalty = clamp(t.loyalty + 0.08, 0, 1);
+          this.tally[t.id].festival = true;
           this.logEvent('festival', t.id, `${t.name} celebrated a Harvest Festival`);
         }
       }
@@ -1304,8 +1394,8 @@ export class SimulationEngine {
             }
           }
           const bonus = rel.stance === 'alliance' ? 2.2 : 1.5;
-          capA.stockpile.food += bonus;
-          capB.stockpile.food += bonus;
+          capA.stockpile.food += bonus * (1 + capA.culture.commerce + (capA.mods.trade ?? 0));
+          capB.stockpile.food += bonus * (1 + capB.culture.commerce + (capB.mods.trade ?? 0));
           capA.stockpile.timber += 0.5;
           capB.stockpile.timber += 0.5;
         }
@@ -1325,11 +1415,146 @@ export class SimulationEngine {
     loser.stockpile.stone *= 0.7;
     this.addFx('firework', victor.basePosition.x, victor.basePosition.y, victor.color);
     this.logEvent('realm', victor.id, `${victor.name} expanded its lands after overthrowing ${loser.name}`);
+    const known = new Set(victor.inventions.map((inv) => inv.name));
+    const loot = loser.inventions.filter((inv) => !known.has(inv.name));
+    if (loot.length > 0) {
+      const inv = loot[Math.floor(this.rng.next() * loot.length)];
+      victor.inventions.push({ ...inv, effects: { ...inv.effects } });
+      victor.mods = computeMods(victor.inventions);
+      this.logEvent('invention', victor.id, `${victor.name} seized the secret of ${inv.name} from ${loser.name}`);
+    }
+  }
+
+  private nearWater(t: Tribe): boolean {
+    const { x, y } = t.basePosition;
+    return this.distToRiver(x, y).dist < 320 || this.lakes.some((lk) => Math.hypot(lk.x - x, lk.y - y) < lk.radius + 260);
+  }
+
+  /** Nightly: hardships build pressure, experience reshapes culture, and research may pay off. */
+  private advanceCulture(): void {
+    const cfg = this.config;
+    const winter = this.season === 'winter';
+    const pops = this.tribePopulations();
+    const kills = this.tribes.map(() => 0);
+    const intSum = this.tribes.map(() => 0);
+    for (const b of this.blobs) {
+      kills[b.tribeId] += b.kills;
+      if (b.state === 'active') intSum[b.tribeId] += b.genes.intelligence;
+    }
+    const living: { t: Tribe; pop: number; wet: boolean; lab: boolean; rate: number }[] = [];
+    for (const t of this.tribes) {
+      const pop = pops[t.id];
+      if (t.extinct || pop === 0) continue;
+      const tally = this.tally[t.id] ?? emptyTally();
+      const own = this.structures.filter((s) => s.tribeId === t.id && s.built);
+      const has = (type: StructureType) => own.some((s) => s.type === type);
+      let wars = 0;
+      let pacts = 0;
+      for (const rel of this.relations.values()) {
+        if (rel.a !== t.realmId && rel.b !== t.realmId) continue;
+        if (rel.stance === 'war') wars++;
+        else if (rel.stance === 'trade' || rel.stance === 'alliance') pacts++;
+      }
+      const roads = this.roads.filter((rd) => rd.built && (rd.fromTribeId === t.id || rd.toTribeId === t.id)).length;
+      const raided = this.lastRaided[t.id] === this.day;
+      const wet = this.nearWater(t);
+
+      const p = t.pressure;
+      for (const k of Object.keys(p) as (keyof typeof p)[]) p[k] *= 0.92;
+      p.war += (raided ? 1 : 0) + wars * 0.6 + kills[t.id] * 0.3;
+      p.hunger += tally.starved + (t.stockpile.food < pop * cfg.ration * 3 ? 1 : 0);
+      if (winter) p.cold += tally.disease + 0.4;
+      if (wet) p.water += 0.5;
+      p.trade += pacts * 0.8 + (has('market') ? 0.5 : 0) + (has('dock') ? 0.2 : 0) + roads * 0.3;
+      p.build += tally.completed * 0.8 + (has('workshop') ? 0.2 : 0) + (has('factory') ? 0.3 : 0) + (has('lab') ? 0.3 : 0);
+      if (t.stockpile.timber + t.stockpile.stone > 250) p.wealth += 0.6;
+      p.devotion += (tally.festival ? 3 : 0) + (has('monument') ? 0.5 : 0) + (has('palace') ? 0.3 : 0) + (tally.disease + tally.starved) * 0.5;
+
+      const avgInt = intSum[t.id] / pop;
+      const rate =
+        (0.6 +
+          pop * 0.05 +
+          Math.max(0, avgInt - 1) * 2 +
+          (has('workshop') ? 0.8 : 0) +
+          (has('lab') ? 2.5 : 0) +
+          (has('market') ? 0.6 : 0) +
+          (has('monument') ? 0.4 : 0)) *
+        (1 + (t.mods.insight ?? 0)) *
+        (1 + t.culture.craft * 0.5);
+      living.push({ t, pop, wet, lab: has('lab'), rate });
+    }
+
+    const pressures = living.map((l) => l.t.pressure);
+    const signals = pressures.map(traitSignals);
+    const worldSignal = { martial: 0, commerce: 0, faith: 0, craft: 0 };
+    for (const s of signals) for (const k of TRAITS) worldSignal[k] += s[k] / signals.length;
+
+    living.forEach(({ t, pop, wet, lab, rate }, i) => {
+      const c = t.culture;
+      driftCulture(c, signals[i], worldSignal, 0.04);
+
+      const ethos = ethosOf(c);
+      // Shades of the same culture (Warlike ↔ Crusader) shift slowly; real upheavals sooner.
+      const kin = ethosTraits(ethos).some((k) => ethosTraits(t.ethos).includes(k));
+      if (ethos !== t.ethos && this.day - t.ethosDay >= (kin ? ETHOS_KIN_DAYS : ETHOS_MIN_DAYS)) {
+        t.ethos = ethos;
+        t.ethosDay = this.day;
+        const why: Record<CultureTrait, string> = {
+          martial: 'hardened by war',
+          commerce: 'grown rich on trade',
+          faith: 'bound together by faith',
+          craft: 'shaped by its builders',
+        };
+        const reason = ethos === 'Pragmatic' ? 'its old convictions faded' : why[dominantTrait(c)];
+        this.logEvent('culture', t.id, `${t.name} became ${withArticle(ethos)} culture, ${reason}`);
+      }
+
+      t.insight += rate;
+      const need = this.insightNeeded(t);
+      if (t.insight >= need) {
+        t.insight -= need;
+        this.invent(t, pop, wet, lab, relativePressures(pressures, t.pressure));
+      }
+    });
+  }
+
+  /** Research a tribe needs for its next invention. */
+  insightNeeded(t: Tribe): number {
+    return INSIGHT_BASE + INSIGHT_STEP * t.inventions.length;
+  }
+
+  private invent(t: Tribe, pop: number, nearWater: boolean, hasLab: boolean, pressure: Pressures): void {
+    const tier = this.settlementTier(pop, t.id);
+    const maxTier = tier === 'camp' ? 1 : tier === 'village' ? 2 : tier === 'town' ? 3 : 4;
+    const s = t.stockpile;
+    const richest: ResourceType = s.stone >= s.timber && s.stone >= s.food ? 'stone' : s.timber >= s.food ? 'timber' : 'food';
+    const couldSwim = (t.mods.swim ?? 0) > 0;
+    const inv = createInvention(this.rng, {
+      culture: t.culture,
+      pressure,
+      nearWater,
+      hasLab,
+      winter: this.season === 'winter',
+      richest,
+      tribeName: t.name,
+      known: t.inventions,
+      maxTier,
+      day: this.day,
+      inventorId: t.id,
+    });
+    t.inventions.push(inv);
+    t.mods = computeMods(t.inventions);
+    const trait = DOMAINS[inv.domain].trait;
+    t.culture[trait] += 0.02;
+    normalizeCulture(t.culture);
+    this.logEvent('invention', t.id, `${t.name} invented ${inv.name} (${describeEffects(inv.effects, !couldSwim)})`);
+    this.addFx('invention', t.basePosition.x, t.basePosition.y - 46, t.color, { text: inv.name });
   }
 
   structureLimit(tribe: Tribe, type: StructureType): number {
     const per = CONQUEST_LIMIT_BONUS[type] ?? 0;
-    return STRUCTURE_SPECS[type].limit + Math.floor(per * Math.min(tribe.conquests, MAX_CONQUEST_BONUS));
+    const cultural = CULTURE_LIMIT_BONUS[dominantTrait(tribe.culture)][type] ?? 0;
+    return STRUCTURE_SPECS[type].limit + Math.floor(per * Math.min(tribe.conquests, MAX_CONQUEST_BONUS)) + cultural;
   }
 
   private livingTribeCount(): number {
@@ -1337,7 +1562,7 @@ export class SimulationEngine {
   }
 
   private addFx(
-    kind: 'clash' | 'splash' | 'spark' | 'popup' | 'firework',
+    kind: 'clash' | 'splash' | 'spark' | 'popup' | 'firework' | 'invention',
     x: number,
     y: number,
     color: string,
@@ -1593,11 +1818,14 @@ export class SimulationEngine {
     // ones fastest, and bushes left alone for a while grow lusher than they started.
     const growth = growthMultiplier(doy, cfg.yearLength);
     const bushRate = (cfg.foodPerDay / REFERENCE_BUSHES) * growth;
+    const farmOwner = new Map<number, Tribe>();
+    for (const s of this.structures) if (s.type === 'farm') farmOwner.set(s.id, this.tribes[s.tribeId]);
     for (const n of this.nodes) {
       if (n.type === 'food') {
         const f = n.amount / n.max;
         const fishMult = n.isFish ? Math.max(0.35, growth) : growth;
-        const farmBonus = n.farmStructureId !== undefined ? 1.5 * growth : 0;
+        const farming = n.farmStructureId !== undefined ? (farmOwner.get(n.farmStructureId)?.mods.farming ?? 0) : 0;
+        const farmBonus = n.farmStructureId !== undefined ? 1.5 * growth * (1 + farming) : 0;
         const rate = n.isFish ? (cfg.foodPerDay / REFERENCE_BUSHES) * fishMult * 1.1 : bushRate;
         n.amount = Math.min(n.max, n.amount + rate * 1.6 * (0.5 + 2 * f) * (1 - f) + rate * 0.05 + farmBonus);
         const step = n.baseMax * 0.05;
@@ -1612,6 +1840,7 @@ export class SimulationEngine {
     }
 
     for (const t of this.tribes) t.deliveredToday = emptyStock();
+    this.tally = this.tribes.map(() => emptyTally());
     for (const s of this.structures) s.lastHitTick = -999;
 
     for (const b of this.blobs) {
@@ -1696,7 +1925,8 @@ export class SimulationEngine {
       const alive = members.filter((b) => b.state === 'active');
       if (winter) {
         const hasHospital = this.structures.some((s) => s.tribeId === tribe.id && s.type === 'hospital' && s.built);
-        const diseaseChance = cfg.winterDiseaseChance * (hasHospital ? 0.2 : 1);
+        const diseaseChance =
+          cfg.winterDiseaseChance * (hasHospital ? 0.2 : 1) * (1 - (tribe.mods.medicine ?? 0)) * (1 - (tribe.mods.warmth ?? 0) * 0.5);
         const beds = this.housing(tribe.id) - cfg.housingBase;
         for (let i = beds; i < alive.length; i++) {
           if (this.rng.next() < diseaseChance) this.kill(alive[i], 'disease');
@@ -1715,7 +1945,7 @@ export class SimulationEngine {
 
       // Spoilage of anything the granaries can't protect.
       const safe = this.safeFoodCapacity(tribe.id);
-      if (stock.food > safe) stock.food = safe + (stock.food - safe) * (1 - cfg.spoilRate);
+      if (stock.food > safe) stock.food = safe + (stock.food - safe) * (1 - cfg.spoilRate * (1 - (tribe.mods.preserve ?? 0)));
 
       const survivors = members.filter((b) => b.state === 'active');
       this.reproduce(tribe, survivors, fitness);
@@ -1742,6 +1972,7 @@ export class SimulationEngine {
       this.updateHallOfFame();
     }
     this.processRealms();
+    this.advanceCulture();
 
     // Camp for the night: survivors gather in rings around their Town Center, and tribes assign tomorrow's jobs.
     for (const tribe of this.tribes) {
@@ -1881,7 +2112,8 @@ export class SimulationEngine {
       .map((rd) => (rd.fromTribeId === tribe.id ? rd.toTribeId : rd.fromTribeId))
       .filter((id) => !this.tribes[id]?.extinct);
 
-    let soldiers = n >= 6 ? Math.max(1, Math.round(n * (raidedRecently ? 0.25 : 0.1))) : 0;
+    const martialDuty = Math.max(0, tribe.culture.martial - CULTURE_BASELINE) * 0.25;
+    let soldiers = n >= 6 ? Math.max(1, Math.round(n * ((raidedRecently ? 0.25 : 0.1) + martialDuty))) : 0;
     let builders = hasBlueprint ? Math.max(1, Math.round(n * 0.22)) : 0;
     let carriers = roadNeighbors.length > 0 && n >= 7 ? Math.min(2, Math.max(1, Math.floor(n * 0.1))) : 0;
     let scouts = n >= 9 ? 1 : 0;
@@ -1938,6 +2170,8 @@ export class SimulationEngine {
     const stock = tribe.stockpile;
 
     const limit = (type: StructureType) => this.structureLimit(tribe, type);
+    const leaning = dominantTrait(tribe.culture);
+    const devoted = tribe.culture[leaning] >= DEVOTED_SHARE;
     const wants: StructureType[] = [];
     if (count('shelter') < Math.min(limit('shelter'), Math.ceil(pop / cfg.shelterCapacity))) wants.push('shelter');
     if (count('granary') === 0 || (count('granary') < limit('granary') && stock.food > this.safeFoodCapacity(tribe.id) * 0.8)) {
@@ -1946,8 +2180,13 @@ export class SimulationEngine {
     if (tier !== 'camp' && count('farm') < limit('farm')) wants.push('farm');
     if (nearRiver && count('dock') < limit('dock')) wants.push('dock');
     if (nearRiver && count('bridge') < limit('bridge')) wants.push('bridge');
-    if (tier !== 'camp' && count('workshop') < limit('workshop')) wants.push('workshop');
-    if ((tier !== 'camp' || isMajorCapital) && count('market') < limit('market')) wants.push('market');
+    // A strongly held culture reaches for its signature buildings a stage early.
+    if ((tier !== 'camp' || (devoted && leaning === 'craft')) && count('workshop') < limit('workshop')) wants.push('workshop');
+    if ((tier !== 'camp' || isMajorCapital || (devoted && leaning === 'commerce')) && count('market') < limit('market')) {
+      wants.push('market');
+    }
+    if (devoted && leaning === 'faith' && tier === 'village' && count('monument') < limit('monument')) wants.push('monument');
+    if (devoted && leaning === 'martial' && tier === 'village' && count('watchtower') < limit('watchtower')) wants.push('watchtower');
     if (count('barricade') < limit('barricade') && (raidedRecently || count('shelter') + count('granary') >= 2)) {
       wants.push('barricade');
     }
@@ -1964,8 +2203,17 @@ export class SimulationEngine {
     if (isModern && count('monument') < limit('monument')) wants.push('monument');
     if (isMajorCapital && count('palace') < limit('palace')) wants.push('palace');
 
-    for (const type of wants) {
-      const cost = STRUCTURE_SPECS[type].cost;
+    const unique = [...new Set(wants)];
+    const favored = CULTURE_FAVORS[leaning];
+    const essential: StructureType[] = unique.filter((t) => t === 'shelter' || t === 'granary');
+    const ordered = devoted
+      ? [...essential, ...unique.filter((t) => !essential.includes(t) && favored.includes(t)), ...unique.filter((t) => !essential.includes(t) && !favored.includes(t))]
+      : unique;
+    const thrift = 1 - (tribe.mods.thrift ?? 0);
+
+    for (const type of ordered) {
+      const spec = STRUCTURE_SPECS[type].cost;
+      const cost = { timber: Math.round(spec.timber * thrift), stone: Math.round(spec.stone * thrift) };
       // Save up for the top priority rather than frittering materials on lesser builds.
       if (stock.timber < cost.timber || stock.stone < cost.stone) return;
       const slot = this.findSlot(tribe, type);
@@ -2018,10 +2266,56 @@ export class SimulationEngine {
     const outerRings = (from: number, spacing: number) => {
       for (let d = from; d <= tribe.territory * 0.8; d += 34) ring(d, away, spacing);
     };
+    const style = this.styleOf(tribe);
+    if (type !== 'farm' && type !== 'barricade' && type !== 'watchtower') {
+      // Each culture lays out new quarters its own way; the generic rings below are the fallback.
+      const reach = CORE_STRUCTURES.has(type) ? 112 : tribe.territory * 0.8;
+      if (style === 'bazaar') {
+        // Street grid: blocks of buildings between avenues that cross at the Town Hall.
+        const G = 44;
+        const n = Math.ceil(reach / G);
+        const cos = Math.cos(toCenter);
+        const sin = Math.sin(toCenter);
+        const pts: [number, number, number][] = [];
+        for (let i = -n; i <= n; i++) {
+          for (let j = -n; j <= n; j++) {
+            if (i % 3 === 0 || j % 3 === 0) continue;
+            const lx = i * G;
+            const ly = j * G;
+            const d = Math.hypot(lx, ly);
+            if (d < 56 || d > reach) continue;
+            pts.push([d, tc.x + lx * cos - ly * sin, tc.y + lx * sin + ly * cos]);
+          }
+        }
+        pts.sort((a, b) => a[0] - b[0]);
+        for (const [, x, y] of pts) candidates.push([x, y]);
+      } else if (style === 'temple') {
+        // Sacred avenues: buildings line eight spokes radiating from the Town Hall.
+        const spokeOrder = [0, 4, 2, 6, 1, 5, 3, 7];
+        for (let d = 64; d <= reach; d += 30) {
+          for (const k of spokeOrder) {
+            const a = away + (k / 8) * Math.PI * 2;
+            candidates.push([tc.x + Math.cos(a) * d, tc.y + Math.sin(a) * d]);
+          }
+        }
+      } else if (style === 'forge') {
+        // Dense workshop quarter spiralling out from the hall.
+        const offset = this.rng.range(0, Math.PI * 2);
+        for (let k = 0; ; k++) {
+          const d = 46 + 20 * Math.sqrt(k);
+          if (d > reach) break;
+          const a = offset + k * 2.39996;
+          candidates.push([tc.x + Math.cos(a) * d, tc.y + Math.sin(a) * d]);
+        }
+      } else {
+        // Fortress towns huddle tight behind their walls.
+        for (let d = 56; d <= Math.min(reach, tribe.territory * 0.6); d += 26) ring(d, away, 30);
+      }
+    }
     if (type === 'barricade' || type === 'watchtower') {
       // Defensive perimeter facing the contested centre, pushed out with the territory.
       const dist = (type === 'watchtower' ? 92 : 104) * scale;
-      if (scale <= 1) {
+      if (scale <= 1 && style !== 'fortress') {
         for (let i = 0; i < 8; i++) {
           const a = toCenter + (i - 3.5) * 0.36;
           candidates.push([tc.x + Math.cos(a) * dist, tc.y + Math.sin(a) * dist]);
@@ -2069,6 +2363,8 @@ export class SimulationEngine {
     b.velocity = 0;
     b.settledTick = this.tick;
     this.dayDeaths[cause]++;
+    const tally = this.tally[b.tribeId];
+    if (tally && (cause === 'starved' || cause === 'disease')) tally[cause]++;
   }
 
   private computeStats(): GenerationStats {
@@ -2146,22 +2442,29 @@ export class SimulationEngine {
 
     for (const b of this.blobs) {
       if (b.state !== 'active') continue;
-      const tc = this.tribes[b.tribeId].basePosition;
+      const tribe = this.tribes[b.tribeId];
+      const tc = tribe.basePosition;
+      const mods = tribe.mods;
 
       this.sense(b, tc.x, tc.y, envSeason);
       const out = b.brain.forward(this.inputs);
       b.turn = out[0] * cfg.maxTurn;
       b.throttle = (out[1] + 1) * 0.5;
-      b.coop = clamp(out[2] + cfg.aggressionBias, -1, 1);
+      // Warlike cultures pick fights; merchant cultures hold back.
+      const cultureBias = -(tribe.culture.martial - CULTURE_BASELINE) * 0.35 + (tribe.culture.commerce - CULTURE_BASELINE) * 0.1;
+      b.coop = clamp(out[2] + cfg.aggressionBias + cultureBias, -1, 1);
       b.coopSum += b.coop;
       b.activeTicks++;
       b.angle = wrapAngle(b.angle + b.turn);
 
       const speed = b.genes.maxSpeed * b.throttle;
       const roadBoost = this.roadBonus(b);
-      b.velocity = speed * cfg.baseVelocity * roadBoost;
+      const swim = mods.swim ?? 0;
+      const swimming = swim > 0 && this.isInWater(b.x, b.y) && !this.onBuiltBridge(b.x, b.y);
+      b.velocity = speed * cfg.baseVelocity * roadBoost * (1 + (mods.speed ?? 0)) * (swimming ? swim : 1);
       const { size, senseRadius, intelligence } = b.genes;
-      const baseDrain = cfg.cBase * (winter && !b.sheltered ? cfg.winterDrainMultiplier : 1);
+      const chill = (cfg.winterDrainMultiplier - 1) * (1 - (mods.warmth ?? 0));
+      const baseDrain = cfg.cBase * (winter && !b.sheltered ? 1 + chill : 1);
       const moveDrain = size * size * size * speed * speed * cfg.cMove;
       b.energy -= moveDrain + senseRadius * cfg.cSense + intelligence * cfg.cBrain + baseDrain;
       if (b.energy <= 0) {
@@ -2172,7 +2475,7 @@ export class SimulationEngine {
 
       const nx = clamp(b.x + Math.cos(b.angle) * b.velocity, 0, L);
       const ny = clamp(b.y + Math.sin(b.angle) * b.velocity, 0, L);
-      const blocked = (x: number, y: number) => this.isInWater(x, y) && !this.onBuiltBridge(x, y);
+      const blocked = (x: number, y: number) => swim <= 0 && this.isInWater(x, y) && !this.onBuiltBridge(x, y);
       if (!blocked(nx, ny)) {
         b.x = nx;
         b.y = ny;
@@ -2200,23 +2503,15 @@ export class SimulationEngine {
     if (this.visualFx.length > 0) {
       this.visualFx = this.visualFx.filter((fx) => {
         const age = (this.day - fx.day) * cfg.dayTicks + (this.tick - fx.tick);
-        const maxAge = fx.kind === 'firework' ? 50 : fx.kind === 'popup' ? 28 : 18;
+        const maxAge = fx.kind === 'invention' ? 140 : fx.kind === 'firework' ? 50 : fx.kind === 'popup' ? 28 : 18;
         return age >= 0 && age <= maxAge;
       });
     }
 
     for (const s of this.structures) {
       if (!s.built && s.health > 0) {
-        s.progress += AUTO_BUILD_RATE;
-        if (s.progress >= s.buildTicks) {
-          s.built = true;
-          if (s.type === 'farm') this.ensureFarmNode(s);
-          if (s.type === 'dock') {
-            const rv = this.distToRiver(s.x, s.y);
-            const fish = this.addNode('food', rv.px, rv.py, 7, 9);
-            fish.isFish = true;
-          }
-        }
+        s.progress += AUTO_BUILD_RATE * (1 + (this.tribes[s.tribeId].mods.build ?? 0));
+        if (s.progress >= s.buildTicks) this.completeStructure(s);
       }
     }
     for (const rd of this.roads) {
@@ -2251,9 +2546,11 @@ export class SimulationEngine {
   private fireWatchtowers(): void {
     for (const s of this.structures) {
       if (s.type !== 'watchtower' || !s.built || this.tribes[s.tribeId].extinct) continue;
+      const towers = this.tribes[s.tribeId].mods.towers ?? 0;
+      const range = WATCHTOWER_RANGE * (1 + towers * 0.5);
       let target: Blob | null = null;
-      let bestD2 = WATCHTOWER_RANGE * WATCHTOWER_RANGE;
-      this.blobGrid.query(s.x, s.y, WATCHTOWER_RANGE, (o, d2) => {
+      let bestD2 = range * range;
+      this.blobGrid.query(s.x, s.y, range, (o, d2) => {
         if (o.state !== 'active' || this.isFriendlyRealm(o.tribeId, s.tribeId)) return;
         if (d2 < bestD2) {
           bestD2 = d2;
@@ -2264,7 +2561,7 @@ export class SimulationEngine {
       if (!hit) continue;
       s.lastHitTick = this.tick;
       this.towerShots.push({ x1: s.x, y1: s.y, x2: hit.x, y2: hit.y, tick: this.tick, color: this.tribes[s.tribeId].color });
-      hit.energy -= WATCHTOWER_DAMAGE;
+      hit.energy -= WATCHTOWER_DAMAGE * (1 + towers);
       if (hit.energy <= 0) {
         hit.energy = 0;
         this.kill(hit, 'slain');
@@ -2274,7 +2571,7 @@ export class SimulationEngine {
 
   /** Fill `this.inputs` with the 13 normalised senses for blob `b`. */
   private sense(b: Blob, hx: number, hy: number, envSeason: number): void {
-    const sense = b.genes.senseRadius;
+    const sense = b.genes.senseRadius * (1 + (this.tribes[b.tribeId].mods.sense ?? 0));
     const inp = this.inputs;
     const nearest = this.nearestNode;
     const nearestD2 = this.nearestD2;
@@ -2446,6 +2743,11 @@ export class SimulationEngine {
     // Unload and refuel at our own Town Center.
     if (dHome <= tc.radius + b.radius + DEPOSIT_REACH) {
       if (b.cargo.type && b.cargo.amount > 0) {
+        const harvest = tribe.mods.harvest ?? 0;
+        if (b.cargo.type === 'food' && harvest > 0) {
+          const extra = b.cargo.amount * harvest;
+          b.cargo.amount += Math.floor(extra) + (this.rng.next() < extra % 1 ? 1 : 0);
+        }
         stock[b.cargo.type] += b.cargo.amount;
         tribe.deliveredToday[b.cargo.type] += b.cargo.amount;
         b.delivered += b.cargo.amount;
@@ -2471,20 +2773,13 @@ export class SimulationEngine {
     if (b.coop >= cfg.cooperationThreshold) {
       // Builders: advance blueprints and repair damaged structures of our tribe (faster with intelligence + labs).
       const hasLab = own.some((s) => s.type === 'lab' && s.built);
-      const workPower = (0.75 + b.genes.intelligence * 0.4) * (hasLab ? 1.25 : 1);
+      const workPower =
+        (0.75 + b.genes.intelligence * 0.4) * (hasLab ? 1.25 : 1) * (1 + (tribe.mods.build ?? 0) + tribe.culture.craft * 0.3);
       for (const s of own) {
         if (Math.hypot(s.x - b.x, s.y - b.y) > s.radius + b.radius + BUILD_REACH) continue;
         if (!s.built) {
           s.progress += workPower;
-          if (s.progress >= s.buildTicks) {
-            s.built = true;
-            if (s.type === 'farm') this.ensureFarmNode(s);
-            if (s.type === 'dock') {
-              const rv = this.distToRiver(s.x, s.y);
-              const fish = this.addNode('food', rv.px, rv.py, 7, 9);
-              fish.isFish = true;
-            }
-          }
+          if (s.progress >= s.buildTicks) this.completeStructure(s);
         } else if (s.health < s.maxHealth) {
           s.health = Math.min(s.maxHealth, s.health + REPAIR_RATE * workPower);
         } else continue;
@@ -2520,7 +2815,9 @@ export class SimulationEngine {
       this.recordHostility(attackerRealm, victim.realmId);
       this.addFx('clash', (b.x + t.x) / 2, (b.y + t.y) / 2, '#ff8a7a');
       this.directorFocus = { x: (b.x + t.x) / 2, y: (b.y + t.y) / 2, day: this.day, tick: this.tick };
-      t.energy -= cfg.attackDamage * (b.genes.size / t.genes.size);
+      const atk = 1 + (this.tribes[b.tribeId].mods.attack ?? 0);
+      const def = 1 + (victim.mods.armor ?? 0);
+      t.energy -= cfg.attackDamage * (b.genes.size / t.genes.size) * (atk / def);
       // Steal their pack if ours is empty.
       if (t.cargo.amount > 0 && b.cargo.amount === 0) {
         b.cargo = { ...t.cargo };
@@ -2558,7 +2855,8 @@ export class SimulationEngine {
         }
         s.health = Math.max(1, s.health - cfg.attackDamage * 0.5);
       } else {
-        s.health -= cfg.attackDamage * (b.genes.size / 1);
+        const atk = 1 + (this.tribes[b.tribeId].mods.attack ?? 0);
+        s.health -= (cfg.attackDamage * b.genes.size * atk) / (1 + (victimTribe.mods.fortify ?? 0));
         if (s.health <= 0) {
           this.structures = this.structures.filter((x) => x !== s);
           if (s.type === 'farm') this.removeFarmNodes(new Set([s.id]));
@@ -2648,7 +2946,24 @@ export class SimulationEngine {
     this.dayDeaths = { ...saved.dayDeaths };
     this.winterStart = saved.winterStart ? new Map(saved.winterStart) : null;
 
-    this.tribes = saved.tribes.map((t) => ({ ...t, territory: t.territory ?? BASE_TERRITORY, conquests: t.conquests ?? 0 }));
+    this.tribes = saved.tribes.map((t) => {
+      const culture = t.culture ?? randomCulture(this.rng);
+      normalizeCulture(culture);
+      const inventions = t.inventions ?? [];
+      return {
+        ...t,
+        territory: t.territory ?? BASE_TERRITORY,
+        conquests: t.conquests ?? 0,
+        culture,
+        ethos: t.ethos ?? ethosOf(culture),
+        ethosDay: t.ethosDay ?? saved.day,
+        inventions,
+        insight: t.insight ?? 0,
+        pressure: { ...emptyPressures(), ...t.pressure },
+        mods: computeMods(inventions),
+      };
+    });
+    this.tally = this.tribes.map(() => emptyTally());
     this.realms = saved.realms;
     this.relations = new Map(saved.relations);
     this.roads = saved.roads;

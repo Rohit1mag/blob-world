@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { TRAIT_COLOR, dominantTrait } from '../engine/culture';
 import type { SimulationEngine } from '../engine/SimulationEngine';
 import type { Blob, ResourceNode, Structure, Tribe } from '../engine/types';
 import { BlobCard, type BlobCardHandle } from './BlobCard';
@@ -472,12 +473,38 @@ function drawVisualFx(ctx: CanvasRenderingContext2D, engine: SimulationEngine, t
   ctx.save();
   for (const fx of engine.visualFx) {
     const age = (engine.day - fx.day) * dayTicks + (engine.tick - fx.tick);
-    const maxAge = fx.kind === 'firework' ? 50 : fx.kind === 'popup' ? 28 : 18;
+    const maxAge = fx.kind === 'invention' ? 140 : fx.kind === 'firework' ? 50 : fx.kind === 'popup' ? 28 : 18;
     const u = Math.min(1, Math.max(0, age / maxAge));
     if (u >= 1) continue;
     const alpha = 1 - u;
 
-    if (fx.kind === 'clash') {
+    if (fx.kind === 'invention' && fx.text) {
+      // A discovery banner that rises off the camp and lingers long enough to read.
+      const fade = Math.min(1, u * 8) * Math.min(1, (1 - u) * 3);
+      const size = 12 * Math.max(0.8, px * 1.1);
+      const y = fx.y - u * 26;
+      ctx.globalAlpha = fade;
+      ctx.font = `700 ${size}px Inter, sans-serif`;
+      ctx.textAlign = 'center';
+      const label = `✦ ${fx.text}`;
+      const w = ctx.measureText(label).width + size * 1.2;
+      ctx.fillStyle = 'rgba(12, 16, 26, 0.82)';
+      ctx.strokeStyle = fx.color;
+      ctx.lineWidth = 1.4 * px;
+      ctx.beginPath();
+      ctx.roundRect(fx.x - w / 2, y - size * 1.05, w, size * 1.55, size * 0.4);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#fff3c4';
+      ctx.fillText(label, fx.x, y);
+      for (let i = 0; i < 6; i++) {
+        const a = time * 2 + (i / 6) * Math.PI * 2;
+        ctx.fillStyle = i % 2 ? fx.color : '#ffd166';
+        ctx.beginPath();
+        ctx.arc(fx.x + Math.cos(a) * (w / 2 + 6), y - size * 0.3 + Math.sin(a) * size * 0.9, 1.6 * Math.max(1, px), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else if (fx.kind === 'clash') {
       ctx.strokeStyle = fx.color;
       ctx.globalAlpha = alpha * 0.85;
       ctx.lineWidth = (2.2 - u * 1.4) * px;
@@ -903,6 +930,8 @@ function drawStructure(
     return;
   }
 
+  if (s.style && !UNSTYLED.has(s.type)) drawStylePlate(ctx, s, px);
+
   if (s.type === 'townCenter') {
     const w = r * 1.5;
     ctx.fillStyle = '#1a2232';
@@ -1216,6 +1245,86 @@ function drawStructure(
   ctx.globalAlpha = 1;
 }
 
+const UNSTYLED = new Set<Structure['type']>(['townCenter', 'farm', 'bridge', 'dock', 'barricade']);
+const PENNANTS = ['#ffd166', '#e05d5d', '#5fe0e0'];
+
+/** Culture-specific foundation, so each quarter of a city reads as the culture that built it. */
+function drawStylePlate(ctx: CanvasRenderingContext2D, s: Structure, px: number): void {
+  const r = s.radius * 1.3;
+  if (s.style === 'fortress') {
+    ctx.fillStyle = 'rgba(58, 63, 75, 0.9)';
+    ctx.strokeStyle = 'rgba(160, 170, 190, 0.6)';
+    ctx.lineWidth = px;
+    ctx.beginPath();
+    ctx.rect(s.x - r, s.y - r, r * 2, r * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#6a7488';
+    for (const [dx, dy] of [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ]) {
+      ctx.beginPath();
+      ctx.arc(s.x + dx * r, s.y + dy * r, r * 0.24, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (s.style === 'bazaar') {
+    ctx.fillStyle = 'rgba(176, 146, 104, 0.5)';
+    ctx.beginPath();
+    ctx.roundRect(s.x - r, s.y - r, r * 2, r * 2, r * 0.2);
+    ctx.fill();
+    ctx.strokeStyle = '#c8d0df';
+    ctx.lineWidth = 0.9 * px;
+    ctx.beginPath();
+    ctx.moveTo(s.x + r * 0.8, s.y - r * 0.6);
+    ctx.lineTo(s.x + r * 0.8, s.y - r * 1.45);
+    ctx.stroke();
+    ctx.fillStyle = PENNANTS[s.id % PENNANTS.length];
+    ctx.beginPath();
+    ctx.moveTo(s.x + r * 0.8, s.y - r * 1.45);
+    ctx.lineTo(s.x + r * 1.3, s.y - r * 1.28);
+    ctx.lineTo(s.x + r * 0.8, s.y - r * 1.1);
+    ctx.closePath();
+    ctx.fill();
+  } else if (s.style === 'temple') {
+    ctx.fillStyle = 'rgba(232, 224, 200, 0.3)';
+    ctx.strokeStyle = 'rgba(245, 196, 81, 0.8)';
+    ctx.lineWidth = 1.2 * px;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#f5c451';
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 + Math.PI / 4;
+      ctx.beginPath();
+      ctx.arc(s.x + Math.cos(a) * r, s.y + Math.sin(a) * r, r * 0.12, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (s.style === 'forge') {
+    ctx.fillStyle = 'rgba(43, 38, 34, 0.8)';
+    ctx.strokeStyle = 'rgba(255, 154, 74, 0.55)';
+    ctx.lineWidth = px;
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      if (i === 0) ctx.moveTo(s.x + Math.cos(a) * r, s.y + Math.sin(a) * r);
+      else ctx.lineTo(s.x + Math.cos(a) * r, s.y + Math.sin(a) * r);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#3a302a';
+    ctx.fillRect(s.x + r * 0.45, s.y - r * 1.15, r * 0.3, r * 0.55);
+    ctx.fillStyle = '#ff9a4a';
+    ctx.beginPath();
+    ctx.arc(s.x + r * 0.6, s.y - r * 1.2, r * 0.14, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
 /** Simple outline icon so blueprints read as the building they will become. */
 function drawStructureGlyph(ctx: CanvasRenderingContext2D, s: Structure, color: string, px: number): void {
   const r = s.radius * 0.55;
@@ -1268,7 +1377,10 @@ function drawCampLabel(ctx: CanvasRenderingContext2D, t: Tribe, engine: Simulati
     ctx.font = `500 ${8.5 * k}px "JetBrains Mono", monospace`;
     ctx.fillStyle = 'rgba(200,208,223,0.75)';
     const s = t.stockpile;
-    ctx.fillText(`${pop} pop · ${Math.floor(s.food)}f ${s.timber}w ${s.stone}s`, x, y + 22 + 23 * k);
+    ctx.fillText(`${pop} pop · ${Math.floor(s.food)}f ${Math.floor(s.timber)}w ${Math.floor(s.stone)}s`, x, y + 22 + 23 * k);
+    ctx.font = `italic 500 ${8.5 * k}px Inter, sans-serif`;
+    ctx.fillStyle = TRAIT_COLOR[dominantTrait(t.culture)];
+    ctx.fillText(`${t.ethos} · ${t.inventions.length} inventions`, x, y + 22 + 33 * k);
   }
 }
 
@@ -1289,6 +1401,24 @@ function drawBlob(ctx: CanvasRenderingContext2D, b: Blob, engine: SimulationEngi
   const r = b.radius * scale;
   const h = b.angle;
   ctx.globalAlpha = alpha;
+
+  // Seafaring tribes paddle across water in little boats.
+  if (!dead && (tribe.mods.swim ?? 0) > 0 && engine.isInWater(b.x, b.y)) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(h);
+    ctx.fillStyle = '#7a5532';
+    ctx.strokeStyle = '#3d2a19';
+    ctx.lineWidth = 0.8 * px;
+    ctx.beginPath();
+    ctx.moveTo(r * 1.9, 0);
+    ctx.quadraticCurveTo(r * 0.6, r * 1.25, -r * 1.4, r * 0.9);
+    ctx.lineTo(-r * 1.4, -r * 0.9);
+    ctx.quadraticCurveTo(r * 0.6, -r * 1.25, r * 1.9, 0);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // Subtle aura for high-intelligence blobs, plus lantern glow on scouts & carriers at dusk/night.
   if (!dead && (b.job === 'scout' || b.job === 'carrier')) {

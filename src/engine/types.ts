@@ -130,7 +130,62 @@ export interface Structure {
   occupants: number;
   /** Tick of the last hit, for the damage flash. */
   lastHitTick: number;
+  /** Architecture of the culture that raised it; older quarters keep their original look. */
+  style?: ArchStyle;
 }
+
+export type CultureTrait = 'martial' | 'commerce' | 'faith' | 'craft';
+export type Culture = Record<CultureTrait, number>;
+export type ArchStyle = 'fortress' | 'bazaar' | 'temple' | 'forge';
+
+export type InventionDomain =
+  | 'warfare'
+  | 'defense'
+  | 'agriculture'
+  | 'medicine'
+  | 'construction'
+  | 'travel'
+  | 'seafaring'
+  | 'commerce'
+  | 'knowledge'
+  | 'faith';
+
+/** Tribe-wide modifiers granted by inventions; each is a bonus over the base rules. */
+export type ModKey =
+  | 'attack'
+  | 'armor'
+  | 'fortify'
+  | 'towers'
+  | 'build'
+  | 'thrift'
+  | 'harvest'
+  | 'carry'
+  | 'speed'
+  | 'warmth'
+  | 'medicine'
+  | 'preserve'
+  | 'farming'
+  | 'loyalty'
+  | 'insight'
+  | 'swim'
+  | 'sense'
+  | 'trade';
+export type Mods = Partial<Record<ModKey, number>>;
+
+export interface Invention {
+  name: string;
+  domain: InventionDomain;
+  /** Secondary field for hybrid inventions like "Sacred Spears". */
+  hybrid?: InventionDomain;
+  tier: number;
+  effects: Mods;
+  day: number;
+  /** Tribe that first came up with it (differs from the holder if it was seized in a conquest). */
+  inventorId: number;
+}
+
+export type PressureKey = 'war' | 'hunger' | 'cold' | 'water' | 'trade' | 'build' | 'wealth' | 'devotion';
+export type Pressures = Record<PressureKey, number>;
 
 export type TribeOrigin = 'founder' | 'split' | 'wanderers';
 export type GameMode = 'endless' | 'lastStanding';
@@ -172,6 +227,18 @@ export interface Tribe {
   conquests: number;
   /** Totals gathered/delivered today, reset each morning. */
   deliveredToday: Stockpile;
+  /** 0–1 per trait; drifts with what the tribe lives through. */
+  culture: Culture;
+  /** Name of the culture's current character, e.g. "Crusader". */
+  ethos: string;
+  ethosDay: number;
+  inventions: Invention[];
+  /** Research progress toward the next invention. */
+  insight: number;
+  /** Recent hardships and opportunities that steer what gets invented. */
+  pressure: Pressures;
+  /** Summed invention effects, recomputed whenever the list changes. */
+  mods: Mods;
 }
 
 export type Season = 'summer' | 'fall' | 'winter';
@@ -403,7 +470,21 @@ export interface RealmStatus {
 /** Something notable that happened, for the chronicle feed. */
 export interface WorldEvent {
   day: number;
-  kind: 'split' | 'wanderers' | 'fell' | 'realm' | 'vassal' | 'rebel' | 'trade' | 'alliance' | 'war' | 'peace' | 'festival' | 'road';
+  kind:
+    | 'split'
+    | 'wanderers'
+    | 'fell'
+    | 'realm'
+    | 'vassal'
+    | 'rebel'
+    | 'trade'
+    | 'alliance'
+    | 'war'
+    | 'peace'
+    | 'festival'
+    | 'road'
+    | 'invention'
+    | 'culture';
   tribeId: number;
   text: string;
 }

@@ -2,8 +2,9 @@ import { MapControls } from '@react-three/drei';
 import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber';
 import { useEffect, useMemo, useRef, useState, type ComponentRef, type ReactNode, type RefObject } from 'react';
 import * as THREE from 'three';
+import { TRAIT_COLOR, dominantTrait } from '../engine/culture';
 import type { SimulationEngine } from '../engine/SimulationEngine';
-import type { Blob, Structure, Tribe } from '../engine/types';
+import type { ArchStyle, Blob, Structure, Tribe } from '../engine/types';
 import { BlobCard, type BlobCardHandle } from './BlobCard';
 import { RESOURCE_COLORS } from './blobColor';
 import { easeOutBack, seasonWeights, smoothstep } from './seasonVisuals';
@@ -279,7 +280,17 @@ function CampLabels({ engine, labelRefs }: { engine: SimulationEngine; labelRefs
               </div>
               {!t.extinct && (
                 <div className="font-mono text-[9px] text-ink-300">
-                  {pops[t.id]} pop · {Math.floor(t.stockpile.food)}f {t.stockpile.timber}w {t.stockpile.stone}s
+                  {pops[t.id]} pop · {Math.floor(t.stockpile.food)}f {Math.floor(t.stockpile.timber)}w {Math.floor(t.stockpile.stone)}s
+                </div>
+              )}
+              {!t.extinct && (
+                <div className="text-[9px] italic" style={{ color: TRAIT_COLOR[dominantTrait(t.culture)] }}>
+                  {t.ethos} · {t.inventions.length} inventions
+                </div>
+              )}
+              {!t.extinct && latestInvention(engine, t) && (
+                <div className="mt-0.5 rounded border border-amber-300/50 bg-ink-950/80 px-1.5 text-[10px] font-semibold text-amber-100">
+                  ✦ {latestInvention(engine, t)}
                 </div>
               )}
             </div>
@@ -287,6 +298,12 @@ function CampLabels({ engine, labelRefs }: { engine: SimulationEngine; labelRefs
         })}
     </>
   );
+}
+
+/** Name of an invention the tribe came up with in the last day or so, for the camp label. */
+function latestInvention(engine: SimulationEngine, t: Tribe): string | null {
+  const last = t.inventions[t.inventions.length - 1];
+  return last && last.inventorId === t.id && engine.day - last.day <= 1 ? last.name : null;
 }
 
 function LabelProjector({ engine, labelRefs }: { engine: SimulationEngine; labelRefs: RefObject<Map<number, HTMLDivElement>> }) {
@@ -1316,6 +1333,10 @@ function StructureMesh({
       </group>
     );
   }
+  const accent =
+    s.style && !UNSTYLED_3D.has(s.type) ? (
+      <StyleAccent style={s.style} r={r} top={s.type === 'palace' ? 40 : r * (TOP_HEIGHT[s.type] ?? 1.4)} id={s.id} opacity={opacity} />
+    ) : null;
   return (
     <group
       position={[s.x - L / 2, 0, s.y - L / 2]}
@@ -1329,7 +1350,10 @@ function StructureMesh({
           : undefined
       }
     >
-      <group ref={group}>{body}</group>
+      <group ref={group}>
+        {body}
+        {accent}
+      </group>
       {s.health < s.maxHealth && s.built && (
         <mesh position-y={r * 2 + 6} rotation-x={-Math.PI / 4}>
           <planeGeometry args={[r * 2 * (s.health / s.maxHealth), 2.5]} />
@@ -1337,6 +1361,101 @@ function StructureMesh({
         </mesh>
       )}
     </group>
+  );
+}
+
+const UNSTYLED_3D = new Set<Structure['type']>(['townCenter', 'farm', 'bridge', 'dock', 'barricade']);
+/** Roof height of each building as a multiple of its radius, where rooftop accents sit. */
+const TOP_HEIGHT: Partial<Record<Structure['type'], number>> = {
+  granary: 1.95,
+  shelter: 1.4,
+  workshop: 1.65,
+  market: 1.2,
+  factory: 1.95,
+  powerPlant: 1.35,
+  lab: 1.3,
+  hospital: 1.35,
+  skyscraper: 6.2,
+  watchtower: 3.2,
+  monument: 2.7,
+};
+const PENNANTS_3D = ['#ffd166', '#e05d5d', '#5fe0e0'];
+
+/** Foundation and rooftop flourish in the style of the culture that raised the building. */
+function StyleAccent({ style, r, top, id, opacity }: { style: ArchStyle; r: number; top: number; id: number; opacity: number }) {
+  const m = (color: string, extra: Partial<THREE.MeshStandardMaterialParameters> = {}) => (
+    <meshStandardMaterial color={color} transparent={opacity < 1} opacity={opacity} roughness={0.85} {...extra} />
+  );
+  if (style === 'fortress') {
+    const c = r * 1.3;
+    return (
+      <>
+        <mesh position-y={0.8} receiveShadow>
+          <boxGeometry args={[c * 2, 1.6, c * 2]} />
+          {m('#3d4250')}
+        </mesh>
+        {[
+          [-c, -c],
+          [c, -c],
+          [c, c],
+          [-c, c],
+        ].map(([x, z], i) => (
+          <mesh key={i} position={[x, r * 0.45, z]} castShadow>
+            <cylinderGeometry args={[r * 0.24, r * 0.28, r * 0.9, 6]} />
+            {m('#5a6475', { flatShading: true })}
+          </mesh>
+        ))}
+      </>
+    );
+  }
+  if (style === 'bazaar') {
+    const c = r * 1.25;
+    return (
+      <>
+        <mesh position-y={0.5} receiveShadow>
+          <boxGeometry args={[c * 2, 1, c * 2]} />
+          {m('#a8885c')}
+        </mesh>
+        <mesh position={[c * 0.85, (top + 8) / 2, c * 0.85]}>
+          <cylinderGeometry args={[0.35, 0.35, top + 8, 5]} />
+          {m('#c8d0df')}
+        </mesh>
+        <mesh position={[c * 0.85 + 3, top + 6, c * 0.85]}>
+          <boxGeometry args={[6, 3.5, 0.4]} />
+          <meshStandardMaterial color={PENNANTS_3D[id % PENNANTS_3D.length]} side={THREE.DoubleSide} transparent={opacity < 1} opacity={opacity} />
+        </mesh>
+      </>
+    );
+  }
+  if (style === 'temple') {
+    return (
+      <>
+        <mesh position-y={0.6} receiveShadow>
+          <cylinderGeometry args={[r * 1.35, r * 1.4, 1.2, 20]} />
+          {m('#e8e0c8')}
+        </mesh>
+        <mesh position-y={top + r * 0.45} castShadow>
+          <coneGeometry args={[r * 0.22, r * 0.9, 8]} />
+          {m('#f5c451', { metalness: 0.5, roughness: 0.35, emissive: '#f5c451', emissiveIntensity: 0.15 })}
+        </mesh>
+      </>
+    );
+  }
+  return (
+    <>
+      <mesh position-y={0.6} receiveShadow>
+        <cylinderGeometry args={[r * 1.35, r * 1.35, 1.2, 6]} />
+        {m('#3a302a', { flatShading: true })}
+      </mesh>
+      <mesh position={[r * 0.75, (top * 0.9 + 4) / 2, -r * 0.6]} castShadow>
+        <cylinderGeometry args={[r * 0.13, r * 0.17, top * 0.9 + 4, 8]} />
+        {m('#2b2622')}
+      </mesh>
+      <mesh position={[r * 0.75, top * 0.9 + 4.4, -r * 0.6]}>
+        <sphereGeometry args={[r * 0.16, 8, 6]} />
+        <meshStandardMaterial color="#ff9a4a" emissive="#ff7a2a" emissiveIntensity={0.9} transparent={opacity < 1} opacity={opacity} />
+      </mesh>
+    </>
   );
 }
 

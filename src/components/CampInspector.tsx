@@ -1,5 +1,8 @@
+import { TRAITS, TRAIT_COLOR, TRAIT_LABEL, describeEffects, dominantTrait } from '../engine/culture';
 import type { SimulationEngine } from '../engine/SimulationEngine';
 import type { DiplomaticStance, StructureType } from '../engine/types';
+
+const ERA = ['Primitive', 'Classical', 'Industrial', 'Modern'];
 
 interface CampInspectorProps {
   engine: SimulationEngine;
@@ -103,6 +106,55 @@ export function CampInspector({ engine, tribeId, onClose, onAction }: CampInspec
               <span className="font-mono text-ink-200">{Math.round(tribe.loyalty * 100)}%</span>
             </div>
           )}
+
+          <div className="mt-2 border-t border-ink-700/60 pt-2">
+            <div className="mb-1 flex items-baseline justify-between">
+              <span className="text-[9.5px] font-medium tracking-wider text-ink-500 uppercase">Culture</span>
+              <span className="text-[10.5px] font-semibold italic" style={{ color: TRAIT_COLOR[dominantTrait(tribe.culture)] }}>
+                {tribe.ethos}
+              </span>
+            </div>
+            <div className="flex h-1.5 overflow-hidden rounded-full bg-ink-800">
+              {TRAITS.map((k) => (
+                <div key={k} style={{ width: `${tribe.culture[k] * 100}%`, background: TRAIT_COLOR[k] }} title={`${TRAIT_LABEL[k]} ${Math.round(tribe.culture[k] * 100)}%`} />
+              ))}
+            </div>
+            <div className="mt-1 flex justify-between text-[9px] text-ink-500">
+              {TRAITS.map((k) => (
+                <span key={k} style={{ color: TRAIT_COLOR[k] }}>
+                  {TRAIT_LABEL[k]} {Math.round(tribe.culture[k] * 100)}%
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-2 border-t border-ink-700/60 pt-2">
+            <div className="mb-1 flex items-baseline justify-between">
+              <span className="text-[9.5px] font-medium tracking-wider text-ink-500 uppercase">Inventions</span>
+              <span className="font-mono text-[9.5px] text-ink-500">
+                next {Math.min(99, Math.floor((tribe.insight / engine.insightNeeded(tribe)) * 100))}%
+              </span>
+            </div>
+            {tribe.inventions.length === 0 ? (
+              <div className="text-[10px] text-ink-500">Nothing yet. Research builds up every night.</div>
+            ) : (
+              <ul className="max-h-28 space-y-0.5 overflow-y-auto pr-0.5">
+                {[...tribe.inventions].reverse().map((inv, i) => {
+                  const seized = inv.inventorId !== tribe.id ? engine.tribes[inv.inventorId] : null;
+                  return (
+                    <li key={`${inv.name}-${i}`} className="text-[10px] leading-snug">
+                      <span className="font-medium text-amber-100">✦ {inv.name}</span>
+                      <span className="ml-1 text-ink-500">
+                        {ERA[inv.tier - 1]} · d{inv.day}
+                        {seized ? ` · from ${seized.name}` : ''}
+                      </span>
+                      <div className="text-[9.5px] text-ink-400">{describeEffects(inv.effects)}</div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
 
           {builtCounts.size > 0 && (
             <div className="mt-2 flex flex-wrap gap-1">
