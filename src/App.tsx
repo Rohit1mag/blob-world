@@ -8,8 +8,20 @@ import { useAnimationFrame } from './components/useAnimationFrame';
 import { PRESETS } from './engine/config';
 import { SimulationEngine, type SavedSimulation } from './engine/SimulationEngine';
 import type { DayStatus } from './engine/types';
+import { supabaseConfigured } from './lib/supabase';
+import {
+  createWorld,
+  ensurePlayer,
+  listWorlds,
+  loadWorld,
+  queueWorldSave,
+  saveWorld,
+  setCloudErrorReporter,
+  type WorldMeta,
+} from './lib/worlds';
 
 const SAVE_KEY = 'blobworld:save:v1';
+const ACTIVE_WORLD_KEY = 'blobworld:active-world';
 
 /** Simulation ticks per second at 1×. */
 const BASE_TPS = 60;
@@ -17,6 +29,8 @@ const BASE_TPS = 60;
 const MAX_TICKS_PER_FRAME = 50;
 /** Per-frame CPU budget for the Max setting, leaving headroom for rendering. */
 const MAX_FRAME_BUDGET_MS = 11;
+/** Per-frame CPU budget while fast-forwarding a year; the UI stays responsive at a lower frame rate. */
+const SKIP_FRAME_BUDGET_MS = 40;
 /** Params that only take effect when the world is regenerated. */
 const RESET_ONLY: (keyof LiveParams)[] = ['blobsPerTribe', 'tribeCount', 'mode'];
 
@@ -60,15 +74,79 @@ export default function App() {
   const [savedLabel, setSavedLabel] = useState<string | null>(() =>
     restoredDayRef.current !== null ? `d${restoredDayRef.current}` : null,
   );
+  const [worlds, setWorlds] = useState<WorldMeta[]>([]);
+  const [activeWorldId, setActiveWorldId] = useState<string | null>(null);
+  const [booting, setBooting] = useState(supabaseConfigured);
+  const [cloudNote, setCloudNote] = useState<string | null>(null);
+  const worldIdRef = useRef<string | null>(null);
+
+  const rememberWorld = useCallback((id: string, list: WorldMeta[]) => {
+    worldIdRef.current = id;
+    localStorage.setItem(ACTIVE_WORLD_KEY, id);
+    setActiveWorldId(id);
+    setWorlds(list);
+  }, []);
 
   const saveProgress = useCallback(() => {
+    const snapshot = engine.toJSON();
     try {
-      localStorage.setItem(SAVE_KEY, JSON.stringify(engine.toJSON()));
+      localStorage.setItem(SAVE_KEY, JSON.stringify(snapshot));
       setSavedLabel(`d${engine.day}`);
     } catch {
-      // Ignore quota errors.
+      // Ignore quota errors. The cloud copy is the durable save.
     }
+    if (worldIdRef.current) queueWorldSave(worldIdRef.current, snapshot);
   }, [engine]);
+
+  useEffect(() => {
+    setCloudErrorReporter((message) => setCloudNote(message));
+  }, []);
+
+  useEffect(() => {
+    if (!supabaseConfigured) return;
+    let cancelled = false;
+    const boot = async () => {
+      try {
+        await ensurePlayer();
+        let list = await listWorlds();
+        const storedId = localStorage.getItem(ACTIVE_WORLD_KEY);
+        const chosen = list.find((world) => world.id === storedId) ?? list[0] ?? null;
+        if (!chosen) {
+          const created = await createWorld(engine.toJSON());
+          list = await listWorlds();
+          if (cancelled) return;
+          rememberWorld(created.id, list);
+          return;
+        }
+        const remote = await loadWorld(chosen.id);
+        const localDay = restoredDayRef.current;
+        if (localDay === null || remote.day >= localDay) {
+          engine.loadJSON(remote);
+          setParams(paramsFrom(engine));
+          setRevision(engine.revision);
+          setStatus(engine.getStatus());
+          setSavedLabel(`d${engine.day}`);
+          try {
+            localStorage.setItem(SAVE_KEY, JSON.stringify(remote));
+          } catch {
+            // The cloud copy is already loaded.
+          }
+        } else {
+          await saveWorld(chosen.id, engine.toJSON());
+        }
+        if (cancelled) return;
+        rememberWorld(chosen.id, await listWorlds());
+      } catch (err) {
+        if (!cancelled) setCloudNote(err instanceof Error ? err.message : 'Cloud unavailable');
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    };
+    void boot();
+    return () => {
+      cancelled = true;
+    };
+  }, [engine, rememberWorld]);
 
   const playingRef = useRef(playing);
   const speedRef = useRef(speed);
@@ -80,6 +158,13 @@ export default function App() {
     setStatus(engine.getStatus());
   }, [engine]);
 
+  const skipRef = useRef<{ startDay: number; target: number } | null>(null);
+  const [skipProgress, setSkipProgress] = useState<number | null>(null);
+  const stopSkip = useCallback(() => {
+    skipRef.current = null;
+    setSkipProgress(null);
+  }, []);
+
   // Fixed-timestep driver: simulation rate is decoupled from frame rate, and the
   // loop is suspended entirely while the tab is hidden.
   const loop = useRef({ acc: 0, lastStatusAt: 0, lastChartAt: 0, lastRevision: engine.revision });
@@ -87,8 +172,22 @@ export default function App() {
     const l = loop.current;
     const dt = Math.min(100, rawDt);
     const s = speedRef.current;
+    const skip = skipRef.current;
 
-    if (playingRef.current) {
+    if (skip) {
+      const deadline = performance.now() + SKIP_FRAME_BUDGET_MS;
+      while (engine.day < skip.target && !engine.finished && performance.now() < deadline) engine.runTicks(25);
+      if (engine.day >= skip.target || engine.finished) {
+        stopSkip();
+        if (engine.finished) setPlaying(false);
+        syncUi();
+        saveProgress();
+      } else {
+        const span = Math.max(1, skip.target - skip.startDay);
+        setSkipProgress((engine.day - skip.startDay + engine.tick / engine.config.dayTicks) / span);
+      }
+      l.acc = 0;
+    } else if (playingRef.current) {
       if (s === 'max') {
         const deadline = now + MAX_FRAME_BUDGET_MS;
         for (let done = 0; done < MAX_TICKS_PER_FRAME && !engine.finished; done += 10) {
@@ -106,12 +205,12 @@ export default function App() {
       l.acc = 0;
     }
 
-    const chartInterval = s === 'max' ? 120 : 0;
+    const chartInterval = skip ? 300 : s === 'max' ? 120 : 0;
     if (engine.revision !== l.lastRevision && now - l.lastChartAt >= chartInterval) {
       l.lastRevision = engine.revision;
       l.lastChartAt = now;
       setRevision(engine.revision);
-      if (engine.day % 5 === 0 && engine.phase === 'day' && engine.tick === 0) {
+      if (!skip && engine.day % 5 === 0 && engine.phase === 'day' && engine.tick === 0) {
         saveProgress();
       }
     }
@@ -145,24 +244,91 @@ export default function App() {
   }, [engine]);
 
   const stepDay = useCallback(() => {
+    stopSkip();
     setPlaying(false);
     engine.advanceDay();
     syncUi();
     saveProgress();
-  }, [engine, syncUi, saveProgress]);
+  }, [engine, syncUi, saveProgress, stopSkip]);
+
+  const skipYear = useCallback(() => {
+    if (skipRef.current) {
+      stopSkip();
+      syncUi();
+      saveProgress();
+      return;
+    }
+    if (engine.finished) return;
+    skipRef.current = { startDay: engine.day, target: engine.nextYearStartDay };
+    setSkipProgress(0);
+  }, [engine, syncUi, saveProgress, stopSkip]);
 
   const reset = useCallback(() => {
+    stopSkip();
     engine.reset({ ...params, seed: randomSeed() });
     setPinnedId(null);
     setSelectedTribeId(null);
     syncUi();
     saveProgress();
-  }, [engine, params, syncUi, saveProgress]);
+  }, [engine, params, syncUi, saveProgress, stopSkip]);
+
+  const newWorld = useCallback(async () => {
+    stopSkip();
+    setPlaying(false);
+    const previousId = worldIdRef.current;
+    const previous = engine.toJSON();
+    if (previousId) await saveWorld(previousId, previous);
+    engine.reset({ ...params, seed: randomSeed() });
+    try {
+      const created = await createWorld(engine.toJSON());
+      try {
+        localStorage.setItem(SAVE_KEY, JSON.stringify(engine.toJSON()));
+      } catch {
+        // Cloud already has this world.
+      }
+      setPinnedId(null);
+      setSelectedTribeId(null);
+      syncUi();
+      rememberWorld(created.id, await listWorlds());
+      setSavedLabel(`d${engine.day}`);
+      setCloudNote(null);
+    } catch (err) {
+      engine.loadJSON(previous);
+      syncUi();
+      throw err;
+    }
+  }, [engine, params, rememberWorld, syncUi, stopSkip]);
+
+  const switchWorld = useCallback(
+    async (id: string) => {
+      if (id === worldIdRef.current) return;
+      stopSkip();
+      setPlaying(false);
+      if (worldIdRef.current) await saveWorld(worldIdRef.current, engine.toJSON());
+      const saved = await loadWorld(id);
+      engine.loadJSON(saved);
+      try {
+        localStorage.setItem(SAVE_KEY, JSON.stringify(saved));
+      } catch {
+        // The selected world is loaded from the cloud.
+      }
+      setParams(paramsFrom(engine));
+      setActivePreset(null);
+      setPinnedId(null);
+      setSelectedTribeId(null);
+      syncUi();
+      rememberWorld(id, await listWorlds());
+      setSavedLabel(`d${engine.day}`);
+      setCloudNote(null);
+    },
+    [engine, rememberWorld, syncUi, stopSkip],
+  );
 
   const applyPreset = useCallback(
     (id: string) => {
       const preset = PRESETS.find((p) => p.id === id);
       if (!preset) return;
+      stopSkip();
       engine.reset({ ...preset.config, tribeCount: params.tribeCount, mode: params.mode, seed: randomSeed() });
       setParams(paramsFrom(engine));
       setActivePreset(id);
@@ -170,7 +336,7 @@ export default function App() {
       syncUi();
       saveProgress();
     },
-    [engine, params.tribeCount, params.mode, syncUi, saveProgress],
+    [engine, params.tribeCount, params.mode, syncUi, saveProgress, stopSkip],
   );
 
   const setParam = useCallback(
@@ -188,9 +354,16 @@ export default function App() {
       if (e.code === 'Space') {
         e.preventDefault();
         togglePlay();
+      } else if (e.code === 'ArrowRight' && e.shiftKey) {
+        e.preventDefault();
+        skipYear();
       } else if (e.code === 'ArrowRight') {
         e.preventDefault();
         stepDay();
+      } else if (e.key === 'y' || e.key === 'Y') {
+        skipYear();
+      } else if (e.key === 'Escape' && skipRef.current) {
+        skipYear();
       } else if (e.key === 'r' || e.key === 'R') {
         reset();
       } else if (e.key === 'f' || e.key === 'F') {
@@ -203,7 +376,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [togglePlay, stepDay, reset, selectFittest]);
+  }, [togglePlay, stepDay, skipYear, reset, selectFittest]);
 
   const pending = {
     foodPerDay: params.foodPerDay !== engine.config.foodPerDay,
@@ -216,6 +389,11 @@ export default function App() {
 
   return (
     <div className="flex min-h-full flex-col gap-3 p-4 lg:h-full">
+      {booting && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink-950/80 text-[13px] text-ink-200">
+          Loading your worlds…
+        </div>
+      )}
       <header className="flex flex-wrap items-end justify-between gap-3 px-1">
         <div>
           <h1 className="text-[19px] font-semibold tracking-tight text-ink-200">
@@ -250,12 +428,19 @@ export default function App() {
         activePreset={activePreset}
         onTogglePlay={togglePlay}
         onStepDay={stepDay}
+        onSkipYear={skipYear}
+        skipProgress={skipProgress}
+        nextYear={status.year + 1}
         onSpeed={setSpeed}
         onParam={setParam}
         onPreset={applyPreset}
         onReset={reset}
         onSave={saveProgress}
-        savedLabel={savedLabel}
+        savedLabel={cloudNote ?? savedLabel}
+        worlds={worlds}
+        activeWorldId={activeWorldId}
+        onNewWorld={supabaseConfigured ? () => void newWorld().catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not start a world')) : undefined}
+        onSwitchWorld={supabaseConfigured ? (id) => void switchWorld(id).catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not open that world')) : undefined}
         onSelectFittest={selectFittest}
       />
 
@@ -386,7 +571,7 @@ export default function App() {
               <span><span className="inline-block h-2 w-2 rounded-full bg-[#5fe0e0]" /> scout</span>
             </span>
             <span className="ml-auto">
-              {viewMode === '2d' ? 'Scroll to zoom · drag to pan · ' : ''}Space play · → step · R reset · F fittest · V 2D/3D · D director
+              {viewMode === '2d' ? 'Scroll to zoom · drag to pan · ' : ''}Space play · → step · Y next year · R reset · F fittest · V 2D/3D · D director
             </span>
           </footer>
         </section>

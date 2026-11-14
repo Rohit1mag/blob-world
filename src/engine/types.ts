@@ -166,6 +166,10 @@ export interface Tribe {
   /** Accumulated raid pressure from foreign realms, used for vassalization. */
   raidPressure: number;
   lastRaiderRealmId: number | null;
+  /** Radius of land the camp claims; grows each time it overthrows another camp. */
+  territory: number;
+  /** Camps this tribe has conquered or razed, which raises its building limits. */
+  conquests: number;
   /** Totals gathered/delivered today, reset each morning. */
   deliveredToday: Stockpile;
 }

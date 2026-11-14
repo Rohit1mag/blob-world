@@ -4,6 +4,7 @@ import type { Blob, ResourceNode, Structure, Tribe } from '../engine/types';
 import { BlobCard, type BlobCardHandle } from './BlobCard';
 import { RESOURCE_COLORS, tribePalette } from './blobColor';
 import { easeOutBack, seasonWeights, smoothstep } from './seasonVisuals';
+import { territoryOutline, traceOutline } from './territory';
 import { useAnimationFrame } from './useAnimationFrame';
 import { useElementSize } from './useElementSize';
 
@@ -748,26 +749,27 @@ function drawTowerShots(ctx: CanvasRenderingContext2D, engine: SimulationEngine,
 function drawTerritory(ctx: CanvasRenderingContext2D, t: Tribe, engine: SimulationEngine, night: number, px: number): void {
   const p = tribePalette(t.color);
   const { x, y } = t.basePosition;
-  const g = ctx.createRadialGradient(x, y, 20, x, y, 165);
-  g.addColorStop(0, p.alpha(0.12 + 0.1 * Math.sin(Math.PI * night)));
-  g.addColorStop(1, p.alpha(0));
+  const outline = territoryOutline(engine, t);
+  const reach = outline.reduce((m, [ox, oy]) => Math.max(m, Math.hypot(ox - x, oy - y)), t.territory);
+  const g = ctx.createRadialGradient(x, y, 20, x, y, reach);
+  g.addColorStop(0, p.alpha(0.14 + 0.1 * Math.sin(Math.PI * night)));
+  g.addColorStop(0.75, p.alpha(0.06));
+  g.addColorStop(1, p.alpha(0.02));
   ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.arc(x, y, 165, 0, Math.PI * 2);
+  traceOutline(ctx, outline);
   ctx.fill();
 
   const realm = engine.realms[t.realmId];
-  if (realm && realm.tier !== 'chiefdom') {
-    const rp = tribePalette(realm.color);
-    ctx.save();
-    ctx.strokeStyle = rp.alpha(realm.capitalId === t.id ? 0.5 : 0.28);
-    ctx.lineWidth = (realm.capitalId === t.id ? 2 : 1.2) * px;
-    ctx.setLineDash(realm.capitalId === t.id ? [] : [5 * px, 5 * px]);
-    ctx.beginPath();
-    ctx.arc(x, y, 165, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-  }
+  const inRealm = realm && realm.tier !== 'chiefdom';
+  ctx.save();
+  const borderColor = inRealm ? tribePalette(realm.color) : p;
+  const isCapital = inRealm && realm.capitalId === t.id;
+  ctx.strokeStyle = borderColor.alpha(inRealm ? (isCapital ? 0.55 : 0.3) : 0.22);
+  ctx.lineWidth = (isCapital ? 2.2 : 1.3) * px * (t.conquests > 0 ? 1.3 : 1);
+  ctx.setLineDash(inRealm && !isCapital ? [5 * px, 5 * px] : []);
+  traceOutline(ctx, outline);
+  ctx.stroke();
+  ctx.restore();
 
   // Towns, cities, and metropolises get a stone/steel perimeter ring.
   let pop = 0;
@@ -778,8 +780,7 @@ function drawTerritory(ctx: CanvasRenderingContext2D, t: Tribe, engine: Simulati
     ctx.strokeStyle = tier === 'metropolis' ? 'rgba(110, 210, 255, 0.35)' : 'rgba(170, 180, 200, 0.28)';
     ctx.lineWidth = (tier === 'metropolis' ? 3 : 2.4) * px;
     ctx.setLineDash([10 * px, 6 * px]);
-    ctx.beginPath();
-    ctx.arc(x, y, 118, 0, Math.PI * 2);
+    traceOutline(ctx, territoryOutline(engine, t, 118 / 165, false));
     ctx.stroke();
     ctx.restore();
   }

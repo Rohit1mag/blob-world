@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import type { ScenarioPreset } from '../engine/config';
 import type { GameMode } from '../engine/types';
+import type { WorldMeta } from '../lib/worlds';
 
 export type SpeedSetting = 1 | 5 | 25 | 'max';
 export const SPEEDS: SpeedSetting[] = [1, 5, 25, 'max'];
@@ -66,12 +67,20 @@ interface ControlsBarProps {
   activePreset: string | null;
   onTogglePlay: () => void;
   onStepDay: () => void;
+  onSkipYear: () => void;
+  /** 0–1 while fast-forwarding to the next year, otherwise null. */
+  skipProgress: number | null;
+  nextYear: number;
   onSpeed: (s: SpeedSetting) => void;
   onParam: <K extends keyof LiveParams>(key: K, value: LiveParams[K]) => void;
   onPreset: (id: string) => void;
   onReset: () => void;
   onSave?: () => void;
   savedLabel?: string | null;
+  worlds?: WorldMeta[];
+  activeWorldId?: string | null;
+  onNewWorld?: () => void;
+  onSwitchWorld?: (id: string) => void;
   onSelectFittest: () => void;
 }
 
@@ -158,12 +167,19 @@ export function ControlsBar({
   activePreset,
   onTogglePlay,
   onStepDay,
+  onSkipYear,
+  skipProgress,
+  nextYear,
   onSpeed,
   onParam,
   onPreset,
   onReset,
   onSave,
   savedLabel,
+  worlds,
+  activeWorldId,
+  onNewWorld,
+  onSwitchWorld,
   onSelectFittest,
 }: ControlsBarProps) {
   return (
@@ -187,6 +203,21 @@ export function ControlsBar({
             <rect x="10" y="2" width="2" height="10" rx="0.6" />
           </svg>
         </IconButton>
+        <button
+          type="button"
+          onClick={onSkipYear}
+          title={skipProgress === null ? `Fast-forward to year ${nextYear} (Y)` : 'Stop fast-forwarding (Y or Esc)'}
+          className={`relative flex h-9 min-w-[64px] items-center justify-center overflow-hidden rounded-full border px-3 font-mono text-[11px] transition active:scale-95 ${
+            skipProgress === null
+              ? 'border-ink-700 text-ink-300 hover:border-ink-500 hover:text-ink-200'
+              : 'border-amber-400/60 text-amber-100'
+          }`}
+        >
+          {skipProgress !== null && (
+            <span className="absolute inset-y-0 left-0 bg-amber-400/25" style={{ width: `${Math.round(skipProgress * 100)}%` }} />
+          )}
+          <span className="relative">{skipProgress === null ? `→ Y${nextYear}` : `${Math.round(skipProgress * 100)}% ✕`}</span>
+        </button>
         <IconButton onClick={onReset} title="Reset with a new seed (R)">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
             <path d="M2.5 7a4.5 4.5 0 1 0 1.4-3.3" />
@@ -219,15 +250,39 @@ export function ControlsBar({
           </svg>
           Select Fittest
         </button>
+        {worlds && worlds.length > 0 && onSwitchWorld && (
+          <select
+            value={activeWorldId ?? ''}
+            onChange={(e) => onSwitchWorld(e.target.value)}
+            title="Switch between saved worlds"
+            className="max-w-[190px] truncate rounded-full border border-ink-700 bg-ink-950 px-2.5 py-1 text-[11px] text-ink-200"
+          >
+            {worlds.map((world) => (
+              <option key={world.id} value={world.id}>
+                {world.name} · d{world.day}
+              </option>
+            ))}
+          </select>
+        )}
+        {onNewWorld && (
+          <button
+            type="button"
+            onClick={onNewWorld}
+            title="Start a new world and keep this one"
+            className="rounded-full border border-ink-600/80 px-3 py-1 text-[11px] font-medium text-ink-300 transition hover:border-ink-400 hover:bg-ink-800"
+          >
+            New world
+          </button>
+        )}
         {onSave && (
           <button
             type="button"
             onClick={onSave}
-            title="Save progress to browser storage"
+            title="Save this world to the cloud"
             className="flex items-center gap-1.5 rounded-full border border-ink-600/80 px-3 py-1 text-[11px] font-medium text-ink-300 transition hover:border-ink-400 hover:bg-ink-800"
           >
             <span>Save</span>
-            {savedLabel && <span className="font-mono text-[10px] text-emerald-300/90">{savedLabel}</span>}
+            {savedLabel && <span className="max-w-[140px] truncate font-mono text-[10px] text-emerald-300/90">{savedLabel}</span>}
           </button>
         )}
       </div>

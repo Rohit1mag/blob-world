@@ -77,6 +77,30 @@ const ROAD_HALF_WIDTH = 16;
 const ROAD_SPEED_BONUS = 1.35;
 const HIGHWAY_SPEED_BONUS = 1.75;
 const SKYSCRAPER_HOUSING = 25;
+export const BASE_TERRITORY = 165;
+const MAX_TERRITORY = 520;
+const VASSAL_TERRITORY_GAIN = 55;
+const CAPITAL_TERRITORY_GAIN = 85;
+const RAZE_TERRITORY_GAIN = 40;
+/** Conquests beyond this stop raising building limits. */
+const MAX_CONQUEST_BONUS = 8;
+/** Extra copies of each building allowed per conquest. */
+const CONQUEST_LIMIT_BONUS: Partial<Record<StructureType, number>> = {
+  shelter: 1,
+  granary: 0.5,
+  farm: 1,
+  barricade: 3,
+  watchtower: 1,
+  dock: 0.5,
+  factory: 0.5,
+  skyscraper: 1,
+  market: 0.34,
+  monument: 0.5,
+};
+/** Buildings that cluster around the Town Center so blobs camping there can use them. */
+const CORE_STRUCTURES = new Set<StructureType>(['shelter', 'granary', 'hospital']);
+/** Buildings that grow into outer districts once a camp's territory expands. */
+const DISTRICT_STRUCTURES = new Set<StructureType>(['factory', 'powerPlant', 'lab', 'skyscraper', 'market', 'monument', 'palace', 'workshop']);
 const RESOURCE_POPUP_COLOR: Record<ResourceType, string> = {
   food: '#b6f36b',
   timber: '#8ce6a0',
@@ -462,6 +486,11 @@ export class SimulationEngine {
     for (let i = 0; i < n && !this.finished; i++) this.step();
   }
 
+  /** Day number on which the next year begins. */
+  get nextYearStartDay(): number {
+    return this.year * this.config.yearLength + 1;
+  }
+
   /** Run until the next day has begun (or the run has ended). */
   advanceDay(): void {
     const target = this.day + 1;
@@ -724,6 +753,8 @@ export class SimulationEngine {
       loyalty: origin === 'split' ? 0.85 : 1,
       raidPressure: 0,
       lastRaiderRealmId: null,
+      territory: BASE_TERRITORY,
+      conquests: 0,
       deliveredToday: emptyStock(),
     };
     if (origin !== 'split' || parentId === null) {
@@ -1092,6 +1123,7 @@ export class SimulationEngine {
         t.raidPressure = 0;
         t.lastRaiderRealmId = null;
         this.logEvent('vassal', t.id, `${t.name} swore fealty to ${this.realmLabel(attackerRealm)}`);
+        this.claimConquest(this.tribes[attackerRealm.capitalId], t, wasCapital ? CAPITAL_TERRITORY_GAIN : VASSAL_TERRITORY_GAIN);
         // If a capital was conquered, its other vassals break free into independent chiefdoms.
         if (wasCapital) {
           for (const other of this.tribes) {
@@ -1279,6 +1311,25 @@ export class SimulationEngine {
         }
       }
     }
+  }
+
+  /** A victor's capital claims more land, takes spoils, and may build more. */
+  private claimConquest(victor: Tribe, loser: Tribe, gain: number): void {
+    if (victor.id === loser.id) return;
+    victor.conquests++;
+    victor.territory = Math.min(MAX_TERRITORY, victor.territory + gain + Math.max(0, loser.territory - BASE_TERRITORY) * 0.25);
+    loser.territory = Math.max(BASE_TERRITORY * 0.8, loser.territory - gain * 0.5);
+    victor.stockpile.timber += loser.stockpile.timber * 0.3;
+    victor.stockpile.stone += loser.stockpile.stone * 0.3;
+    loser.stockpile.timber *= 0.7;
+    loser.stockpile.stone *= 0.7;
+    this.addFx('firework', victor.basePosition.x, victor.basePosition.y, victor.color);
+    this.logEvent('realm', victor.id, `${victor.name} expanded its lands after overthrowing ${loser.name}`);
+  }
+
+  structureLimit(tribe: Tribe, type: StructureType): number {
+    const per = CONQUEST_LIMIT_BONUS[type] ?? 0;
+    return STRUCTURE_SPECS[type].limit + Math.floor(per * Math.min(tribe.conquests, MAX_CONQUEST_BONUS));
   }
 
   private livingTribeCount(): number {
@@ -1676,6 +1727,11 @@ export class SimulationEngine {
         tribe.extinct = true;
         tribe.fallenDay = this.day;
         this.logEvent('fell', tribe.id, `${tribe.name} fell after ${this.day - tribe.foundedDay} days`);
+        const raider = tribe.lastRaiderRealmId !== null ? this.realms[tribe.lastRaiderRealmId] : undefined;
+        if (raider && raider.id !== tribe.realmId && this.day - this.lastRaided[tribe.id] <= 10) {
+          const victor = this.tribes[raider.capitalId];
+          if (victor && !victor.extinct) this.claimConquest(victor, tribe, RAZE_TERRITORY_GAIN);
+        }
       }
     }
 
@@ -1881,31 +1937,32 @@ export class SimulationEngine {
     const nearRiver = this.distToRiver(tribe.basePosition.x, tribe.basePosition.y).dist < 320;
     const stock = tribe.stockpile;
 
+    const limit = (type: StructureType) => this.structureLimit(tribe, type);
     const wants: StructureType[] = [];
-    if (count('shelter') < Math.min(STRUCTURE_SPECS.shelter.limit, Math.ceil(pop / cfg.shelterCapacity))) wants.push('shelter');
-    if (count('granary') === 0 || (count('granary') < STRUCTURE_SPECS.granary.limit && stock.food > this.safeFoodCapacity(tribe.id) * 0.8)) {
+    if (count('shelter') < Math.min(limit('shelter'), Math.ceil(pop / cfg.shelterCapacity))) wants.push('shelter');
+    if (count('granary') === 0 || (count('granary') < limit('granary') && stock.food > this.safeFoodCapacity(tribe.id) * 0.8)) {
       wants.push('granary');
     }
-    if (tier !== 'camp' && count('farm') < STRUCTURE_SPECS.farm.limit) wants.push('farm');
-    if (nearRiver && count('dock') < STRUCTURE_SPECS.dock.limit) wants.push('dock');
-    if (nearRiver && count('bridge') < STRUCTURE_SPECS.bridge.limit) wants.push('bridge');
-    if (tier !== 'camp' && count('workshop') < STRUCTURE_SPECS.workshop.limit) wants.push('workshop');
-    if ((tier !== 'camp' || isMajorCapital) && count('market') < STRUCTURE_SPECS.market.limit) wants.push('market');
-    if (count('barricade') < STRUCTURE_SPECS.barricade.limit && (raidedRecently || count('shelter') + count('granary') >= 2)) {
+    if (tier !== 'camp' && count('farm') < limit('farm')) wants.push('farm');
+    if (nearRiver && count('dock') < limit('dock')) wants.push('dock');
+    if (nearRiver && count('bridge') < limit('bridge')) wants.push('bridge');
+    if (tier !== 'camp' && count('workshop') < limit('workshop')) wants.push('workshop');
+    if ((tier !== 'camp' || isMajorCapital) && count('market') < limit('market')) wants.push('market');
+    if (count('barricade') < limit('barricade') && (raidedRecently || count('shelter') + count('granary') >= 2)) {
       wants.push('barricade');
     }
-    if ((isModern || (tier === 'village' && raidedRecently)) && count('watchtower') < STRUCTURE_SPECS.watchtower.limit) {
+    if ((isModern || (tier === 'village' && raidedRecently)) && count('watchtower') < limit('watchtower')) {
       wants.push('watchtower');
     }
-    if (isModern && count('powerPlant') < STRUCTURE_SPECS.powerPlant.limit) wants.push('powerPlant');
-    if (isModern && count('factory') < STRUCTURE_SPECS.factory.limit) wants.push('factory');
-    if (isModern && count('hospital') < STRUCTURE_SPECS.hospital.limit) wants.push('hospital');
-    if (isModern && count('lab') < STRUCTURE_SPECS.lab.limit) wants.push('lab');
-    if ((tier === 'city' || tier === 'metropolis') && count('skyscraper') < STRUCTURE_SPECS.skyscraper.limit) {
+    if (isModern && count('powerPlant') < limit('powerPlant')) wants.push('powerPlant');
+    if (isModern && count('factory') < limit('factory')) wants.push('factory');
+    if (isModern && count('hospital') < limit('hospital')) wants.push('hospital');
+    if (isModern && count('lab') < limit('lab')) wants.push('lab');
+    if ((tier === 'city' || tier === 'metropolis') && count('skyscraper') < limit('skyscraper')) {
       wants.push('skyscraper');
     }
-    if (isModern && count('monument') < STRUCTURE_SPECS.monument.limit) wants.push('monument');
-    if (isMajorCapital && count('palace') < STRUCTURE_SPECS.palace.limit) wants.push('palace');
+    if (isModern && count('monument') < limit('monument')) wants.push('monument');
+    if (isMajorCapital && count('palace') < limit('palace')) wants.push('palace');
 
     for (const type of wants) {
       const cost = STRUCTURE_SPECS[type].cost;
@@ -1944,32 +2001,63 @@ export class SimulationEngine {
       }
       return null;
     }
+    const scale = Math.max(1, tribe.territory / BASE_TERRITORY);
     const candidates: [number, number][] = [];
+    // Rings sweep outward from a preferred heading, so wider territories fill all the way round.
+    const ring = (dist: number, heading: number, spacing: number) => {
+      const steps = Math.max(8, Math.floor((2 * Math.PI * dist) / spacing));
+      const order: number[] = [];
+      for (let i = 0; i < steps; i++) order.push(i % 2 === 0 ? i / 2 : -(i + 1) / 2);
+      for (const k of order) {
+        const a = heading + (k / steps) * 2 * Math.PI + this.rng.range(-0.06, 0.06);
+        const d = dist + this.rng.range(-8, 8);
+        candidates.push([tc.x + Math.cos(a) * d, tc.y + Math.sin(a) * d]);
+      }
+    };
+    const away = toCenter + Math.PI;
+    const outerRings = (from: number, spacing: number) => {
+      for (let d = from; d <= tribe.territory * 0.8; d += 34) ring(d, away, spacing);
+    };
     if (type === 'barricade' || type === 'watchtower') {
-      // Defensive arc facing the contested centre.
-      const dist = type === 'watchtower' ? 92 : 104;
-      for (let i = 0; i < 8; i++) {
-        const a = toCenter + (i - 3.5) * 0.36;
-        candidates.push([tc.x + Math.cos(a) * dist, tc.y + Math.sin(a) * dist]);
+      // Defensive perimeter facing the contested centre, pushed out with the territory.
+      const dist = (type === 'watchtower' ? 92 : 104) * scale;
+      if (scale <= 1) {
+        for (let i = 0; i < 8; i++) {
+          const a = toCenter + (i - 3.5) * 0.36;
+          candidates.push([tc.x + Math.cos(a) * dist, tc.y + Math.sin(a) * dist]);
+        }
+      } else {
+        ring(dist, toCenter, type === 'watchtower' ? 90 : 36);
       }
     } else if (type === 'farm') {
       for (let i = 0; i < 10; i++) {
-        const a = toCenter + Math.PI + (i - 4.5) * 0.55;
+        const a = away + (i - 4.5) * 0.55;
         candidates.push([tc.x + Math.cos(a) * 84, tc.y + Math.sin(a) * 84]);
       }
-    } else {
+      outerRings(118, 46);
+    } else if (CORE_STRUCTURES.has(type) || scale <= 1) {
       for (const dist of [60, 82, 108]) {
         for (let i = 0; i < 12; i++) {
-          const a = toCenter + Math.PI + (i - 5.5) * 0.52;
+          const a = away + (i - 5.5) * 0.52;
           candidates.push([tc.x + Math.cos(a) * dist, tc.y + Math.sin(a) * dist]);
         }
       }
+      if (!CORE_STRUCTURES.has(type)) outerRings(140, 42);
+    } else {
+      // Expanded camps grow districts: industry and landmarks settle the new outer land first.
+      const from = DISTRICT_STRUCTURES.has(type) ? Math.max(118, tribe.territory * 0.42) : 118;
+      outerRings(from, 42);
+      for (const dist of [60, 82, 108]) ring(dist, away, 38);
     }
     for (const [x, y] of candidates) {
       if (x < r + 4 || y < r + 4 || x > L - r - 4 || y > L - r - 4) continue;
+      if (this.isInWater(x, y)) continue;
       const free = this.structures.every((s) => Math.hypot(s.x - x, s.y - y) > s.radius + r + 6);
       const clearOfNodes = this.nodes.every((n) => Math.hypot(n.x - x, n.y - y) > n.radius + r + 4);
-      if (free && clearOfNodes) return [x, y];
+      const clearOfRivals = this.tribes.every(
+        (o) => o.id === tribe.id || o.extinct || Math.hypot(o.basePosition.x - x, o.basePosition.y - y) > o.territory * 0.55,
+      );
+      if (free && clearOfNodes && clearOfRivals) return [x, y];
     }
     return null;
   }
@@ -2560,7 +2648,7 @@ export class SimulationEngine {
     this.dayDeaths = { ...saved.dayDeaths };
     this.winterStart = saved.winterStart ? new Map(saved.winterStart) : null;
 
-    this.tribes = saved.tribes;
+    this.tribes = saved.tribes.map((t) => ({ ...t, territory: t.territory ?? BASE_TERRITORY, conquests: t.conquests ?? 0 }));
     this.realms = saved.realms;
     this.relations = new Map(saved.relations);
     this.roads = saved.roads;

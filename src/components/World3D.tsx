@@ -7,6 +7,7 @@ import type { Blob, Structure, Tribe } from '../engine/types';
 import { BlobCard, type BlobCardHandle } from './BlobCard';
 import { RESOURCE_COLORS } from './blobColor';
 import { easeOutBack, seasonWeights, smoothstep } from './seasonVisuals';
+import { territoryOutline } from './territory';
 import { useAnimationFrame } from './useAnimationFrame';
 
 type Controls = ComponentRef<typeof MapControls>;
@@ -582,6 +583,62 @@ function Nodes({ engine }: { engine: SimulationEngine }) {
 
 // ───────────────────────────── Settlements ─────────────────────────────
 
+/** Flat territory fill and border built from a world-space outline around `center`. */
+function TerritoryShape({
+  outline,
+  center,
+  y,
+  fillColor,
+  fillOpacity = 0,
+  borderColor,
+  borderOpacity,
+  borderWidth,
+}: {
+  outline: [number, number][];
+  center: { x: number; y: number };
+  y: number;
+  fillColor?: string;
+  fillOpacity?: number;
+  borderColor: string;
+  borderOpacity: number;
+  borderWidth: number;
+}) {
+  const key = outline.map(([px, py]) => `${Math.round(px)},${Math.round(py)}`).join(';');
+  const geometries = useMemo(() => {
+    const local = outline.map(([px, py]) => new THREE.Vector2(px - center.x, -(py - center.y)));
+    const fill = new THREE.ShapeGeometry(new THREE.Shape(local), 1);
+    const ring = new THREE.Shape(local);
+    const inner = local
+      .map((p) => {
+        const len = p.length();
+        return len > borderWidth ? p.clone().multiplyScalar((len - borderWidth) / len) : p.clone();
+      })
+      .reverse();
+    ring.holes.push(new THREE.Path(inner));
+    const border = new THREE.ShapeGeometry(ring, 1);
+    return { fill, border };
+  }, [key, borderWidth]);
+  useEffect(
+    () => () => {
+      geometries.fill.dispose();
+      geometries.border.dispose();
+    },
+    [geometries],
+  );
+  return (
+    <>
+      {fillColor && fillOpacity > 0 && (
+        <mesh rotation-x={-Math.PI / 2} position-y={y} geometry={geometries.fill}>
+          <meshBasicMaterial color={fillColor} transparent opacity={fillOpacity} depthWrite={false} />
+        </mesh>
+      )}
+      <mesh rotation-x={-Math.PI / 2} position-y={y + 0.2} geometry={geometries.border}>
+        <meshBasicMaterial color={borderColor} transparent opacity={borderOpacity} depthWrite={false} />
+      </mesh>
+    </>
+  );
+}
+
 /** Structures, territories, labels and campfires. Re-rendered a few times a second as camps change. */
 function Settlements({
   engine,
@@ -625,16 +682,16 @@ function Settlements({
           <group key={`camp-${s.id}`}>
             <group position={[s.x - L / 2, 0, s.y - L / 2]}>
               {!t.extinct && (
-                <mesh rotation-x={-Math.PI / 2} position-y={0.6}>
-                  <circleGeometry args={[165, 48]} />
-                  <meshBasicMaterial color={t.color} transparent opacity={0.07} depthWrite={false} />
-                </mesh>
-              )}
-              {inRealm && (
-                <mesh rotation-x={-Math.PI / 2} position-y={0.8}>
-                  <ringGeometry args={[162, realm.capitalId === t.id ? 166 : 164.5, 48]} />
-                  <meshBasicMaterial color={realm.color} transparent opacity={realm.capitalId === t.id ? 0.45 : 0.25} depthWrite={false} />
-                </mesh>
+                <TerritoryShape
+                  outline={territoryOutline(engine, t)}
+                  center={t.basePosition}
+                  y={0.6}
+                  fillColor={t.color}
+                  fillOpacity={0.08}
+                  borderColor={inRealm ? realm.color : t.color}
+                  borderOpacity={inRealm ? (realm.capitalId === t.id ? 0.5 : 0.28) : 0.22}
+                  borderWidth={inRealm && realm.capitalId === t.id ? 4 : 2.5}
+                />
               )}
               {!t.extinct &&
                 (() => {
@@ -642,10 +699,14 @@ function Settlements({
                   const tier = engine.settlementTier(pop, t.id);
                   if (tier !== 'town' && tier !== 'city' && tier !== 'metropolis') return null;
                   return (
-                    <mesh rotation-x={-Math.PI / 2} position-y={0.85}>
-                      <ringGeometry args={[116, 119.5, 48]} />
-                      <meshBasicMaterial color={tier === 'metropolis' ? '#6ed2ff' : '#9aa4b8'} transparent opacity={0.34} depthWrite={false} />
-                    </mesh>
+                    <TerritoryShape
+                      outline={territoryOutline(engine, t, 118 / 165, false)}
+                      center={t.basePosition}
+                      y={0.85}
+                      borderColor={tier === 'metropolis' ? '#6ed2ff' : '#9aa4b8'}
+                      borderOpacity={0.34}
+                      borderWidth={3.5}
+                    />
                   );
                 })()}
               {!t.extinct && <Campfire engine={engine} />}
@@ -1616,7 +1677,7 @@ function Minimap({
       ctx.fillStyle = t.color;
       ctx.globalAlpha = 0.18;
       ctx.beginPath();
-      ctx.arc(t.basePosition.x, t.basePosition.y, 165, 0, Math.PI * 2);
+      ctx.arc(t.basePosition.x, t.basePosition.y, t.territory, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalAlpha = 1;
       ctx.fillRect(t.basePosition.x - 14, t.basePosition.y - 14, 28, 28);
