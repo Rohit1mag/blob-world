@@ -7,6 +7,15 @@ export class Random {
     this.state = seed >>> 0;
   }
 
+  getState(): { state: number; spareGaussian: number | null } {
+    return { state: this.state, spareGaussian: this.spareGaussian };
+  }
+
+  setState(saved: { state: number; spareGaussian: number | null }): void {
+    this.state = saved.state >>> 0;
+    this.spareGaussian = saved.spareGaussian ?? null;
+  }
+
   next(): number {
     let t = (this.state = (this.state + 0x6d2b79f5) >>> 0);
     t = Math.imul(t ^ (t >>> 15), t | 1);

@@ -88,9 +88,29 @@ interface LineChartProps {
   xLabel?: string;
   /** Vertical annotations at specific x values. */
   markers?: { x: number; label: string; color: string }[];
+  /** Shaded x-ranges drawn behind the data (e.g. winters). */
+  bands?: Band[];
+  yTickCount?: number;
+}
+
+export interface Band {
+  from: number;
+  to: number;
+  color: string;
 }
 
 const M = { l: 34, r: 10, t: 10, b: 22 };
+
+function BandRects({ bands, sx, top, height }: { bands?: Band[]; sx: (x: number) => number; top: number; height: number }) {
+  if (!bands) return null;
+  return (
+    <>
+      {bands.map((b) => (
+        <rect key={`${b.from}-${b.to}`} x={sx(b.from)} y={top} width={Math.max(1, sx(b.to) - sx(b.from))} height={height} fill={b.color} />
+      ))}
+    </>
+  );
+}
 
 export function LineChart({
   xs,
@@ -102,6 +122,8 @@ export function LineChart({
   yFormat = (v) => String(v),
   xLabel,
   markers,
+  bands,
+  yTickCount = 4,
 }: LineChartProps) {
   const [ref, { width }] = useElementSize<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
@@ -129,7 +151,7 @@ export function LineChart({
       hi = 1;
     }
     const pad = (hi - lo) * 0.08 || 0.5;
-    const yTicks = niceTicks(yMin !== undefined ? lo : lo - pad, hi + pad, 4);
+    const yTicks = niceTicks(yMin !== undefined ? lo : lo - pad, hi + pad, yTickCount);
     const y0 = yTicks[0];
     const y1 = yTicks[yTicks.length - 1];
     const x0 = xs[0] ?? 0;
@@ -150,7 +172,7 @@ export function LineChart({
       (t) => t >= x0 && t <= x1 && Number.isInteger(t),
     );
     return { yTicks, xTicks, sx, sy, paths };
-  }, [xs, series, n, innerW, innerH, yMin, yMax, baseline]);
+  }, [xs, series, n, innerW, innerH, yMin, yMax, baseline, yTickCount]);
 
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
     if (n === 0) return;
@@ -176,6 +198,7 @@ export function LineChart({
                 </linearGradient>
               ))}
           </defs>
+          <BandRects bands={bands} sx={geom.sx} top={M.t} height={innerH} />
           {geom.yTicks.map((t) => (
             <g key={t}>
               <line x1={M.l} x2={width - M.r} y1={geom.sy(t)} y2={geom.sy(t)} stroke="#263045" strokeWidth={1} />
@@ -440,6 +463,204 @@ export function ScatterPlot({ points, xRange, yRange, height, xLabel, yLabel, re
             {yLabel} →
           </text>
         </svg>
+      )}
+    </div>
+  );
+}
+
+interface StackedAreaChartProps {
+  xs: number[];
+  series: Series[];
+  height: number;
+  /** Plot each point as a share of its column total (0–1). */
+  normalize?: boolean;
+  yFormat?: (v: number) => string;
+  xLabel?: string;
+  bands?: Band[];
+}
+
+/** Layers stacked bottom-up in `series` order; hover shows every layer's value for that day. */
+export function StackedAreaChart({ xs, series, height, normalize, yFormat = (v) => String(v), xLabel, bands }: StackedAreaChartProps) {
+  const [ref, { width }] = useElementSize<HTMLDivElement>();
+  const [hover, setHover] = useState<number | null>(null);
+  const n = xs.length;
+  const innerW = Math.max(1, width - M.l - M.r);
+  const innerH = height - M.t - M.b;
+
+  const geom = useMemo(() => {
+    const totals = xs.map((_, i) => series.reduce((s, ser) => s + (ser.values[i] ?? 0), 0));
+    const value = (k: number, i: number) => {
+      const v = series[k].values[i] ?? 0;
+      return normalize ? (totals[i] > 0 ? v / totals[i] : 0) : v;
+    };
+    const peak = normalize ? 1 : Math.max(1, ...totals);
+    const yTicks = normalize ? [0, 0.25, 0.5, 0.75, 1] : niceTicks(0, peak * 1.05, 4);
+    const y1 = yTicks[yTicks.length - 1];
+    const x0 = xs[0] ?? 0;
+    const x1 = n > 1 ? xs[n - 1] : x0 + 1;
+    const sx = (x: number) => M.l + ((x - x0) / (x1 - x0)) * innerW;
+    const sy = (y: number) => M.t + (1 - y / y1) * innerH;
+    const idx = sampleIndices(n, Math.max(2, Math.floor(innerW / 2)));
+    const base = idx.map(() => 0);
+    const layers = series.map((_, k) => {
+      if (idx.length === 0) return '';
+      const lower = base.slice();
+      const upper = idx.map((i, j) => (base[j] += value(k, i)));
+      let d = '';
+      idx.forEach((i, j) => (d += `${j ? 'L' : 'M'}${sx(xs[i]).toFixed(1)},${sy(upper[j]).toFixed(1)}`));
+      for (let j = idx.length - 1; j >= 0; j--) d += `L${sx(xs[idx[j]]).toFixed(1)},${sy(lower[j]).toFixed(1)}`;
+      return d + 'Z';
+    });
+    const xTicks = niceTicks(x0, x1, Math.max(2, Math.floor(innerW / 70))).filter(
+      (t) => t >= x0 && t <= x1 && Number.isInteger(t),
+    );
+    return { layers, yTicks, xTicks, sx, sy, value, totals };
+  }, [xs, series, n, innerW, innerH, normalize]);
+
+  const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (n === 0) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const fx = (e.clientX - rect.left - M.l) / innerW;
+    setHover(Math.max(0, Math.min(n - 1, Math.round(fx * (n - 1)))));
+  };
+  const hx = hover !== null && hover < n ? geom.sx(xs[hover]) : null;
+
+  return (
+    <div ref={ref} className="relative w-full" style={{ height }}>
+      {width > 0 && (
+        <svg width={width} height={height} onMouseMove={onMove} onMouseLeave={() => setHover(null)} className="block">
+          <BandRects bands={bands} sx={geom.sx} top={M.t} height={innerH} />
+          {geom.yTicks.map((t) => (
+            <g key={t}>
+              <line x1={M.l} x2={width - M.r} y1={geom.sy(t)} y2={geom.sy(t)} stroke="#263045" strokeWidth={1} />
+              <text x={M.l - 6} y={geom.sy(t)} dy="0.32em" textAnchor="end" className="fill-ink-500 font-mono text-[9px]">
+                {yFormat(t)}
+              </text>
+            </g>
+          ))}
+          {geom.xTicks.map((t) => (
+            <text key={t} x={geom.sx(t)} y={height - 6} textAnchor="middle" className="fill-ink-500 font-mono text-[9px]">
+              {t}
+            </text>
+          ))}
+          {xLabel && (
+            <text x={width - M.r} y={height - 6} textAnchor="end" className="fill-ink-600 text-[9px]">
+              {xLabel}
+            </text>
+          )}
+          {geom.layers.map((d, k) => (
+            <path key={series[k].id} d={d} fill={series[k].color} fillOpacity={0.55} stroke={series[k].color} strokeWidth={1} strokeOpacity={0.9} />
+          ))}
+          {hx !== null && (
+            <line x1={hx} x2={hx} y1={M.t} y2={M.t + innerH} stroke="#e7edf6" strokeOpacity={0.4} pointerEvents="none" />
+          )}
+        </svg>
+      )}
+      {hx !== null && hover !== null && (
+        <div
+          className="pointer-events-none absolute top-1 rounded-md border border-ink-600/70 bg-ink-900/95 px-2 py-1.5 font-mono text-[10px] shadow-lg"
+          style={hx > width / 2 ? { right: width - hx + 8 } : { left: hx + 8 }}
+        >
+          <div className="mb-0.5 text-ink-400">Day {xs[hover]}</div>
+          {[...series].reverse().map((s) => (
+            <div key={s.id} className="flex items-center gap-1.5 whitespace-nowrap">
+              <span className="h-1.5 w-1.5 rounded-full" style={{ background: s.color }} />
+              <span className="text-ink-400">{s.label}</span>
+              <span className="ml-auto pl-2 text-ink-200 tabular-nums">
+                {(s.format ?? yFormat)(normalize ? geom.value(series.indexOf(s), hover) : (s.values[hover] ?? 0))}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface GroupedBarsProps {
+  /** Values are fractions in [0, 1]; null marks a member that no longer exists. */
+  groups: { label: string; values: (number | null)[] }[];
+  colors: string[];
+  names: string[];
+  height: number;
+  emptyLabel: string;
+}
+
+/** One cluster of bars per group (e.g. per winter), one bar per member (e.g. per tribe). */
+export function GroupedBars({ groups, colors, names, height, emptyLabel }: GroupedBarsProps) {
+  const [ref, { width }] = useElementSize<HTMLDivElement>();
+  const [hover, setHover] = useState<number | null>(null);
+  const innerW = Math.max(1, width - M.l - M.r);
+  const innerH = height - M.t - M.b;
+  const sy = (v: number) => M.t + (1 - v) * innerH;
+  const shown = groups.slice(-8);
+  const gw = shown.length ? innerW / shown.length : innerW;
+  const members = colors.length;
+  const bw = Math.min(14, (gw * 0.78) / Math.max(1, members));
+
+  return (
+    <div ref={ref} className="relative w-full" style={{ height }}>
+      {width > 0 && (
+        <svg width={width} height={height} className="block" onMouseLeave={() => setHover(null)}>
+          {[0, 0.5, 1].map((t) => (
+            <g key={t}>
+              <line x1={M.l} x2={width - M.r} y1={sy(t)} y2={sy(t)} stroke="#263045" />
+              <text x={M.l - 6} y={sy(t)} dy="0.32em" textAnchor="end" className="fill-ink-500 font-mono text-[9px]">
+                {Math.round(t * 100)}%
+              </text>
+            </g>
+          ))}
+          {shown.length === 0 && (
+            <text x={M.l + innerW / 2} y={M.t + innerH / 2} textAnchor="middle" className="fill-ink-500 text-[10px]">
+              {emptyLabel}
+            </text>
+          )}
+          {shown.map((g, gi) => {
+            const cx = M.l + gw * (gi + 0.5);
+            const start = cx - (bw * members) / 2;
+            return (
+              <g key={g.label} onMouseEnter={() => setHover(gi)}>
+                <rect x={cx - gw / 2} y={M.t} width={gw} height={innerH} fill={hover === gi ? 'rgba(231,237,246,0.04)' : 'transparent'} />
+                {g.values.map((v, k) =>
+                  v === null ? (
+                    <text key={k} x={start + bw * (k + 0.5)} y={sy(0) - 2} textAnchor="middle" className="fill-ink-600 text-[8px]">
+                      ×
+                    </text>
+                  ) : (
+                    <rect
+                      key={k}
+                      x={start + bw * k + 0.75}
+                      y={sy(Math.min(1, v))}
+                      width={Math.max(1, bw - 1.5)}
+                      height={Math.max(0.5, sy(0) - sy(Math.min(1, v)))}
+                      rx={1}
+                      fill={colors[k]}
+                      fillOpacity={0.85}
+                    />
+                  ),
+                )}
+                <text x={cx} y={height - 6} textAnchor="middle" className="fill-ink-500 font-mono text-[9px]">
+                  {g.label}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      )}
+      {hover !== null && shown[hover] && (
+        <div
+          className="pointer-events-none absolute top-1 rounded-md border border-ink-600/70 bg-ink-900/95 px-2 py-1.5 font-mono text-[10px] shadow-lg"
+          style={{ left: Math.min(width - 130, M.l + gw * (hover + 0.5) + 10) }}
+        >
+          <div className="mb-0.5 text-ink-400">Winter {shown[hover].label}</div>
+          {shown[hover].values.map((v, k) => (
+            <div key={k} className="flex items-center gap-1.5 whitespace-nowrap">
+              <span className="h-1.5 w-1.5 rounded-full" style={{ background: colors[k] }} />
+              <span className="text-ink-400">{names[k]}</span>
+              <span className="ml-auto pl-2 text-ink-200 tabular-nums">{v === null ? 'fallen' : `${Math.round(v * 100)}%`}</span>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

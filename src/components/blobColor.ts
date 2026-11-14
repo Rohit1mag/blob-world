@@ -1,35 +1,38 @@
-import { GENE_RANGES, type Genes } from '../engine/types';
+import type { ResourceType } from '../engine/types';
 
-const cache = new WeakMap<Genes, { fill: string; stroke: string; rgb: [number, number, number] }>();
+export const RESOURCE_COLORS: Record<ResourceType, string> = {
+  food: '#b6f36b',
+  timber: '#c48a52',
+  stone: '#aab3c5',
+};
 
-function channel(base: number, delta: number): number {
-  const t = Math.min(1, Math.max(0, base + delta));
-  return Math.round(40 + 215 * t);
+export interface TribePalette {
+  fill: string;
+  stroke: string;
+  rgb: [number, number, number];
+  /** `rgba()` of the tribe colour at the given opacity. */
+  alpha: (a: number) => string;
 }
 
-/**
- * R = max speed, G = size, B = sense radius, each measured as log-ratio from the default
- * so the founding population reads as steel blue and drift in any trait shifts the hue.
- */
-export function blobRGB(g: Genes): [number, number, number] {
-  return [
-    channel(0.35, Math.log(g.maxSpeed / GENE_RANGES.maxSpeed.default) * 1.1),
-    channel(0.5, Math.log(g.size / GENE_RANGES.size.default) * 1.3),
-    channel(0.78, Math.log(g.senseRadius / GENE_RANGES.senseRadius.default) * 0.8),
-  ];
+const cache = new Map<string, TribePalette>();
+
+function parseHex(hex: string): [number, number, number] {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-export function blobColors(g: Genes) {
-  let c = cache.get(g);
-  if (!c) {
-    const rgb = blobRGB(g);
-    const [r, gr, b] = rgb;
-    c = {
+export function tribePalette(color: string): TribePalette {
+  let p = cache.get(color);
+  if (!p) {
+    const rgb = parseHex(color);
+    const [r, g, b] = rgb;
+    p = {
       rgb,
-      fill: `rgb(${r},${gr},${b})`,
-      stroke: `rgb(${Math.round(r * 0.55)},${Math.round(gr * 0.55)},${Math.round(b * 0.55)})`,
+      fill: color,
+      stroke: `rgb(${Math.round(r * 0.5)},${Math.round(g * 0.5)},${Math.round(b * 0.5)})`,
+      alpha: (a) => `rgba(${r},${g},${b},${a})`,
     };
-    cache.set(g, c);
+    cache.set(color, p);
   }
-  return c;
+  return p;
 }

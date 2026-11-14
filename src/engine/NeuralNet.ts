@@ -1,18 +1,38 @@
-export const NN_INPUTS = 8;
-export const NN_HIDDEN = 6;
-export const NN_OUTPUTS = 2;
+export interface NetShape {
+  inputs: number;
+  hidden: number;
+  outputs: number;
+}
 
-export const INPUT_LABELS = ['food ∠', 'food d', 'threat ∠', 'threat d', 'prey ∠', 'home ∠', 'energy', 'full'] as const;
-export const OUTPUT_LABELS = ['turn', 'throttle'] as const;
+/** Tribal brain: 13 senses + 7 job flags → 8 hidden → turn, throttle, coopAction. */
+export const BRAIN_SHAPE: NetShape = { inputs: 20, hidden: 8, outputs: 3 };
 
-const W1 = 0;
-const B1 = W1 + NN_HIDDEN * NN_INPUTS;
-const W2 = B1 + NN_HIDDEN;
-const B2 = W2 + NN_OUTPUTS * NN_HIDDEN;
-const PARAM_COUNT = B2 + NN_OUTPUTS;
+export const INPUT_LABELS = [
+  'food ∠',
+  'food d',
+  'wood ∠',
+  'wood d',
+  'stone ∠',
+  'stone d',
+  'ally ∠',
+  'threat ∠',
+  'home ∠',
+  'home d',
+  'season',
+  'cargo',
+  'energy',
+  'forager',
+  'woodcut',
+  'miner',
+  'builder',
+  'soldier',
+  'carrier',
+  'scout',
+] as const;
+export const OUTPUT_LABELS = ['turn', 'throttle', 'coop'] as const;
 
 /** Per-synapse probability of a full re-roll during mutation. */
-const RESET_CHANCE = 0.01;
+const RESET_CHANCE = 0.003;
 
 export interface RandomSource {
   next(): number;
@@ -29,45 +49,59 @@ const mathRandom: RandomSource = {
 };
 
 /**
- * Fixed-topology feed-forward net (8 → 6 tanh → 2 tanh). All parameters live in one flat
- * buffer laid out as [W1 (hidden×input) | b1 | W2 (output×hidden) | b2], and `forward`
- * writes into preallocated activation buffers so the hot loop never allocates.
+ * Fixed-topology feed-forward net (inputs → tanh hidden → tanh outputs). All parameters
+ * live in one flat buffer laid out as [W1 (hidden×input) | b1 | W2 (output×hidden) | b2],
+ * and `forward` writes into preallocated activation buffers so the hot loop never allocates.
  */
 export class NeuralNet {
-  static readonly PARAM_COUNT = PARAM_COUNT;
-
+  readonly shape: NetShape;
   readonly params: Float32Array;
   /** Activations from the most recent `forward` call, kept for visualisation. */
-  readonly input = new Float32Array(NN_INPUTS);
-  readonly hidden = new Float32Array(NN_HIDDEN);
-  readonly output = new Float32Array(NN_OUTPUTS);
+  readonly input: Float32Array;
+  readonly hidden: Float32Array;
+  readonly output: Float32Array;
 
-  constructor(params?: Float32Array) {
-    this.params = params ?? new Float32Array(PARAM_COUNT);
+  private readonly b1: number;
+  private readonly w2: number;
+  private readonly b2: number;
+
+  constructor(shape: NetShape = BRAIN_SHAPE, params?: Float32Array) {
+    this.shape = shape;
+    const { inputs, hidden, outputs } = shape;
+    this.b1 = hidden * inputs;
+    this.w2 = this.b1 + hidden;
+    this.b2 = this.w2 + outputs * hidden;
+    const count = this.b2 + outputs;
+    if (params && params.length !== count) throw new Error(`Expected ${count} params, got ${params.length}`);
+    this.params = params ?? new Float32Array(count);
+    this.input = new Float32Array(inputs);
+    this.hidden = new Float32Array(hidden);
+    this.output = new Float32Array(outputs);
   }
 
-  static random(rng: RandomSource = mathRandom): NeuralNet {
-    const net = new NeuralNet();
-    for (let i = 0; i < PARAM_COUNT; i++) net.params[i] = rng.next() * 2 - 1;
+  static random(shape: NetShape = BRAIN_SHAPE, rng: RandomSource = mathRandom): NeuralNet {
+    const net = new NeuralNet(shape);
+    for (let i = 0; i < net.params.length; i++) net.params[i] = rng.next() * 2 - 1;
     return net;
   }
 
   forward(inputs: ArrayLike<number>): Float32Array {
+    const { inputs: nIn, hidden: nHid, outputs: nOut } = this.shape;
     const p = this.params;
     const x = this.input;
     const h = this.hidden;
     const y = this.output;
-    for (let i = 0; i < NN_INPUTS; i++) x[i] = inputs[i];
-    for (let j = 0; j < NN_HIDDEN; j++) {
-      let sum = p[B1 + j];
-      const row = W1 + j * NN_INPUTS;
-      for (let i = 0; i < NN_INPUTS; i++) sum += p[row + i] * x[i];
+    for (let i = 0; i < nIn; i++) x[i] = inputs[i];
+    for (let j = 0; j < nHid; j++) {
+      let sum = p[this.b1 + j];
+      const row = j * nIn;
+      for (let i = 0; i < nIn; i++) sum += p[row + i] * x[i];
       h[j] = Math.tanh(sum);
     }
-    for (let k = 0; k < NN_OUTPUTS; k++) {
-      let sum = p[B2 + k];
-      const row = W2 + k * NN_HIDDEN;
-      for (let j = 0; j < NN_HIDDEN; j++) sum += p[row + j] * h[j];
+    for (let k = 0; k < nOut; k++) {
+      let sum = p[this.b2 + k];
+      const row = this.w2 + k * nHid;
+      for (let j = 0; j < nHid; j++) sum += p[row + j] * h[j];
       y[k] = Math.tanh(sum);
     }
     return y;
@@ -78,10 +112,10 @@ export class NeuralNet {
    * plus a 1% chance per synapse of being re-rolled uniformly in [-1, 1].
    */
   cloneAndMutate(mutationRate: number, mutationStrength: number, rng: RandomSource = mathRandom): NeuralNet {
-    const child = new NeuralNet(new Float32Array(this.params));
+    const child = new NeuralNet(this.shape, new Float32Array(this.params));
     if (mutationRate <= 0 && mutationStrength <= 0) return child;
     const p = child.params;
-    for (let i = 0; i < PARAM_COUNT; i++) {
+    for (let i = 0; i < p.length; i++) {
       if (rng.next() < RESET_CHANCE) {
         p[i] = rng.next() * 2 - 1;
       } else if (rng.next() < mutationRate) {
@@ -92,18 +126,10 @@ export class NeuralNet {
   }
 
   inputWeight(hidden: number, input: number): number {
-    return this.params[W1 + hidden * NN_INPUTS + input];
-  }
-
-  hiddenBias(hidden: number): number {
-    return this.params[B1 + hidden];
+    return this.params[hidden * this.shape.inputs + input];
   }
 
   outputWeight(output: number, hidden: number): number {
-    return this.params[W2 + output * NN_HIDDEN + hidden];
-  }
-
-  outputBias(output: number): number {
-    return this.params[B2 + output];
+    return this.params[this.w2 + output * this.shape.hidden + hidden];
   }
 }
