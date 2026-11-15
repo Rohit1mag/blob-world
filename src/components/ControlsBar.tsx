@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import type { ScenarioPreset } from '../engine/config';
+import { promotionWeights, TOP_FLOOR, type CorporateConfig, type CultureId, type CulturePreset } from '../engine/CorporateEngine';
 import type { GameMode } from '../engine/types';
 import type { WorldMeta } from '../lib/worlds';
 
@@ -15,10 +16,6 @@ export interface LiveParams {
 }
 
 const TRIBE_COUNTS = [3, 4];
-const MODES: { id: GameMode; label: string; note: string }[] = [
-  { id: 'endless', label: 'Endless', note: 'tribes split, resettle & keep going' },
-  { id: 'lastStanding', label: 'Last standing', note: 'ends when one tribe is left' },
-];
 
 function Segmented<T extends string | number>({
   label,
@@ -158,6 +155,108 @@ function Slider({
   );
 }
 
+function Transport({
+  playing,
+  speed,
+  skipProgress,
+  stepTitle,
+  skipTitle,
+  skipLabel,
+  fittestLabel,
+  fittestTitle,
+  onTogglePlay,
+  onStep,
+  onSkip,
+  onReset,
+  onSpeed,
+  onSelectFittest,
+}: {
+  playing: boolean;
+  speed: SpeedSetting;
+  skipProgress: number | null;
+  stepTitle: string;
+  skipTitle: string;
+  skipLabel: string;
+  fittestLabel: string;
+  fittestTitle: string;
+  onTogglePlay: () => void;
+  onStep: () => void;
+  onSkip: () => void;
+  onReset: () => void;
+  onSpeed: (s: SpeedSetting) => void;
+  onSelectFittest: () => void;
+}) {
+  return (
+    <>
+      <IconButton onClick={onTogglePlay} title={playing ? 'Pause (Space)' : 'Play (Space)'} primary>
+        {playing ? (
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+            <rect x="2.5" y="2" width="3" height="10" rx="0.8" />
+            <rect x="8.5" y="2" width="3" height="10" rx="0.8" />
+          </svg>
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+            <path d="M3.5 2.2v9.6a.6.6 0 0 0 .9.5l7.6-4.8a.6.6 0 0 0 0-1L4.4 1.7a.6.6 0 0 0-.9.5Z" />
+          </svg>
+        )}
+      </IconButton>
+      <IconButton onClick={onStep} title={stepTitle}>
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+          <path d="M2 2.6v8.8a.5.5 0 0 0 .8.4l6.4-4.4a.5.5 0 0 0 0-.8L2.8 2.2a.5.5 0 0 0-.8.4Z" />
+          <rect x="10" y="2" width="2" height="10" rx="0.6" />
+        </svg>
+      </IconButton>
+      <button
+        type="button"
+        onClick={onSkip}
+        title={skipProgress === null ? skipTitle : 'Stop fast-forwarding (Y or Esc)'}
+        className={`relative flex h-9 min-w-[64px] items-center justify-center overflow-hidden rounded-full border px-3 font-mono text-[11px] transition active:scale-95 ${
+          skipProgress === null
+            ? 'border-ink-700 text-ink-300 hover:border-ink-500 hover:text-ink-200'
+            : 'border-amber-400/60 text-amber-100'
+        }`}
+      >
+        {skipProgress !== null && (
+          <span className="absolute inset-y-0 left-0 bg-amber-400/25" style={{ width: `${Math.round(skipProgress * 100)}%` }} />
+        )}
+        <span className="relative">{skipProgress === null ? skipLabel : `${Math.round(skipProgress * 100)}% ✕`}</span>
+      </button>
+      <IconButton onClick={onReset} title="Reset with a new seed (R)">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+          <path d="M2.5 7a4.5 4.5 0 1 0 1.4-3.3" />
+          <path d="M2.5 1.8v2.6h2.6" />
+        </svg>
+      </IconButton>
+      <div className="ml-2 flex rounded-full border border-ink-700 p-0.5">
+        {SPEEDS.map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => onSpeed(s)}
+            className={`rounded-full px-2.5 py-1 font-mono text-[11px] transition ${
+              speed === s ? 'bg-ink-700 text-ink-200' : 'text-ink-500 hover:text-ink-300'
+            }`}
+          >
+            {s === 'max' ? 'Max' : `${s}×`}
+          </button>
+        ))}
+      </div>
+      <button
+        type="button"
+        onClick={onSelectFittest}
+        title={fittestTitle}
+        className="ml-1 flex items-center gap-1.5 rounded-full border border-[#5eead4]/40 px-3 py-1 text-[11px] font-medium text-[#5eead4] transition hover:border-[#5eead4]/80 hover:bg-[#5eead4]/10"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4">
+          <circle cx="6" cy="6" r="4.2" />
+          <circle cx="6" cy="6" r="1.4" fill="currentColor" />
+        </svg>
+        {fittestLabel}
+      </button>
+    </>
+  );
+}
+
 export function ControlsBar({
   playing,
   speed,
@@ -185,71 +284,22 @@ export function ControlsBar({
   return (
     <div className="flex flex-wrap items-center gap-x-6 gap-y-3 rounded-xl border border-ink-700/60 bg-ink-900/70 px-4 py-3">
       <div className="flex items-center gap-2">
-        <IconButton onClick={onTogglePlay} title={playing ? 'Pause (Space)' : 'Play (Space)'} primary>
-          {playing ? (
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-              <rect x="2.5" y="2" width="3" height="10" rx="0.8" />
-              <rect x="8.5" y="2" width="3" height="10" rx="0.8" />
-            </svg>
-          ) : (
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-              <path d="M3.5 2.2v9.6a.6.6 0 0 0 .9.5l7.6-4.8a.6.6 0 0 0 0-1L4.4 1.7a.6.6 0 0 0-.9.5Z" />
-            </svg>
-          )}
-        </IconButton>
-        <IconButton onClick={onStepDay} title="Step 1 day (→)">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-            <path d="M2 2.6v8.8a.5.5 0 0 0 .8.4l6.4-4.4a.5.5 0 0 0 0-.8L2.8 2.2a.5.5 0 0 0-.8.4Z" />
-            <rect x="10" y="2" width="2" height="10" rx="0.6" />
-          </svg>
-        </IconButton>
-        <button
-          type="button"
-          onClick={onSkipYear}
-          title={skipProgress === null ? `Fast-forward to year ${nextYear} (Y)` : 'Stop fast-forwarding (Y or Esc)'}
-          className={`relative flex h-9 min-w-[64px] items-center justify-center overflow-hidden rounded-full border px-3 font-mono text-[11px] transition active:scale-95 ${
-            skipProgress === null
-              ? 'border-ink-700 text-ink-300 hover:border-ink-500 hover:text-ink-200'
-              : 'border-amber-400/60 text-amber-100'
-          }`}
-        >
-          {skipProgress !== null && (
-            <span className="absolute inset-y-0 left-0 bg-amber-400/25" style={{ width: `${Math.round(skipProgress * 100)}%` }} />
-          )}
-          <span className="relative">{skipProgress === null ? `→ Y${nextYear}` : `${Math.round(skipProgress * 100)}% ✕`}</span>
-        </button>
-        <IconButton onClick={onReset} title="Reset with a new seed (R)">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-            <path d="M2.5 7a4.5 4.5 0 1 0 1.4-3.3" />
-            <path d="M2.5 1.8v2.6h2.6" />
-          </svg>
-        </IconButton>
-        <div className="ml-2 flex rounded-full border border-ink-700 p-0.5">
-          {SPEEDS.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => onSpeed(s)}
-              className={`rounded-full px-2.5 py-1 font-mono text-[11px] transition ${
-                speed === s ? 'bg-ink-700 text-ink-200' : 'text-ink-500 hover:text-ink-300'
-              }`}
-            >
-              {s === 'max' ? 'Max' : `${s}×`}
-            </button>
-          ))}
-        </div>
-        <button
-          type="button"
-          onClick={onSelectFittest}
-          title="Pin the highest-scoring active blob and show its brain (F)"
-          className="ml-1 flex items-center gap-1.5 rounded-full border border-[#5eead4]/40 px-3 py-1 text-[11px] font-medium text-[#5eead4] transition hover:border-[#5eead4]/80 hover:bg-[#5eead4]/10"
-        >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4">
-            <circle cx="6" cy="6" r="4.2" />
-            <circle cx="6" cy="6" r="1.4" fill="currentColor" />
-          </svg>
-          Select Fittest
-        </button>
+        <Transport
+          playing={playing}
+          speed={speed}
+          skipProgress={skipProgress}
+          stepTitle="Step 1 day (→)"
+          skipTitle={`Fast-forward to year ${nextYear} (Y)`}
+          skipLabel={`→ Y${nextYear}`}
+          fittestLabel="Select Fittest"
+          fittestTitle="Pin the highest-scoring active blob and show its brain (F)"
+          onTogglePlay={onTogglePlay}
+          onStep={onStepDay}
+          onSkip={onSkipYear}
+          onReset={onReset}
+          onSpeed={onSpeed}
+          onSelectFittest={onSelectFittest}
+        />
         {worlds && worlds.length > 0 && onSwitchWorld && (
           <select
             value={activeWorldId ?? ''}
@@ -332,14 +382,6 @@ export function ControlsBar({
           pending={pending.tribeCount}
           onChange={(n) => onParam('tribeCount', n)}
         />
-        <Segmented
-          label="Mode"
-          options={MODES}
-          value={params.mode}
-          note={MODES.find((m) => m.id === params.mode)!.note}
-          pending={pending.mode}
-          onChange={(m) => onParam('mode', m)}
-        />
       </div>
 
       <div className="flex flex-wrap items-center gap-1.5">
@@ -359,6 +401,130 @@ export function ControlsBar({
             {p.name}
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+export type CorporateParams = Pick<CorporateConfig, 'culture' | 'politicsSteepness' | 'layoffPct' | 'espressoPerk'>;
+
+interface CorporateControlsBarProps {
+  playing: boolean;
+  speed: SpeedSetting;
+  params: CorporateParams;
+  presets: CulturePreset[];
+  skipProgress: number | null;
+  nextFiscalYear: number;
+  onTogglePlay: () => void;
+  onStepQuarter: () => void;
+  onSkipYear: () => void;
+  onSpeed: (s: SpeedSetting) => void;
+  onParam: <K extends keyof CorporateParams>(key: K, value: CorporateParams[K]) => void;
+  onPreset: (id: CultureId) => void;
+  onReset: () => void;
+  onSelectTop: () => void;
+}
+
+/** "God mode" company-culture controls; every knob applies live. */
+export function CorporateControlsBar({
+  playing,
+  speed,
+  params,
+  presets,
+  skipProgress,
+  nextFiscalYear,
+  onTogglePlay,
+  onStepQuarter,
+  onSkipYear,
+  onSpeed,
+  onParam,
+  onPreset,
+  onReset,
+  onSelectTop,
+}: CorporateControlsBarProps) {
+  const active = presets.find((p) => p.id === params.culture);
+  const meritAt = (step: number) => Math.round(promotionWeights(params, step)[0] * 100);
+  return (
+    <div className="flex flex-wrap items-center gap-x-6 gap-y-3 rounded-xl border border-ink-700/60 bg-ink-900/70 px-4 py-3">
+      <div className="flex items-center gap-2">
+        <Transport
+          playing={playing}
+          speed={speed}
+          skipProgress={skipProgress}
+          stepTitle="Run to the next quarterly review (→)"
+          skipTitle={`Fast-forward to FY${nextFiscalYear} (Y)`}
+          skipLabel={`→ FY${nextFiscalYear}`}
+          fittestLabel="Top Performer"
+          fittestTitle="Pin the employee most likely to be promoted and show their brain (F)"
+          onTogglePlay={onTogglePlay}
+          onStep={onStepQuarter}
+          onSkip={onSkipYear}
+          onReset={onReset}
+          onSpeed={onSpeed}
+          onSelectFittest={onSelectTop}
+        />
+      </div>
+
+      <div className="flex min-w-[320px] flex-[2] flex-wrap gap-x-5 gap-y-2">
+        <Slider
+          label="Politics steepness"
+          value={params.politicsSteepness}
+          min={0.5}
+          max={2}
+          step={0.1}
+          display={`${params.politicsSteepness.toFixed(1)}×`}
+          color="#ffb347"
+          note={`merit share F1→F2 ${meritAt(0)}% · into C-Suite ${meritAt(TOP_FLOOR - 1)}%`}
+          onChange={(v) => onParam('politicsSteepness', Math.round(v * 10) / 10)}
+        />
+        <Slider
+          label="Quarterly layoffs"
+          value={Math.round(params.layoffPct * 100)}
+          min={0}
+          max={30}
+          step={1}
+          display={`${Math.round(params.layoffPct * 100)}%`}
+          color="#ff6b6b"
+          note="bottom of Floor 1 cut at each review"
+          onChange={(v) => onParam('layoffPct', v / 100)}
+        />
+        <Slider
+          label="Free espresso perk"
+          value={params.espressoPerk}
+          min={0.25}
+          max={3}
+          step={0.25}
+          display={`${params.espressoPerk.toFixed(2)}×`}
+          color="#ffb347"
+          note="breakroom energy regen"
+          onChange={(v) => onParam('espressoPerk', v)}
+        />
+      </div>
+
+      <div className="flex max-w-[420px] flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="mr-1 text-[10px] font-medium tracking-wider text-ink-500 uppercase">Culture</span>
+          {presets.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              title={`${p.mechanic}: ${p.description}`}
+              onClick={() => onPreset(p.id)}
+              className={`rounded-full border px-3 py-1 text-[11px] font-medium transition ${
+                params.culture === p.id
+                  ? 'border-ink-400 bg-ink-700/70 text-ink-200'
+                  : 'border-ink-700 text-ink-400 hover:border-ink-500 hover:text-ink-200'
+              }`}
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
+        {active && (
+          <p className="text-[10.5px] leading-snug text-ink-500">
+            <span className="font-medium text-ink-300">{active.mechanic}</span> · {active.description}
+          </p>
+        )}
       </div>
     </div>
   );

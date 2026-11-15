@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b",
-    "headless": "tsx scripts/headless.ts"
+    "headless": "tsx scripts/headless.ts",
+    "headless:corporate": "tsx scripts/corporate-headless.ts"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

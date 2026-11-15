@@ -91,6 +91,8 @@ interface LineChartProps {
   /** Shaded x-ranges drawn behind the data (e.g. winters). */
   bands?: Band[];
   yTickCount?: number;
+  /** Tooltip heading for an x value. */
+  xName?: (x: number) => string;
 }
 
 export interface Band {
@@ -124,6 +126,7 @@ export function LineChart({
   markers,
   bands,
   yTickCount = 4,
+  xName = (x) => `Day ${x}`,
 }: LineChartProps) {
   const [ref, { width }] = useElementSize<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
@@ -290,7 +293,7 @@ export function LineChart({
           className="pointer-events-none absolute top-1 rounded-md border border-ink-600/70 bg-ink-900/95 px-2 py-1.5 font-mono text-[10px] shadow-lg"
           style={hx > width / 2 ? { right: width - hx + 8 } : { left: hx + 8 }}
         >
-          <div className="mb-0.5 text-ink-400">Day {xs[hover]}</div>
+          <div className="mb-0.5 text-ink-400">{xName(xs[hover])}</div>
           {series.map((s) => (
             <div key={s.id} className="flex items-center gap-1.5 whitespace-nowrap">
               <span className="h-1.5 w-1.5 rounded-full" style={{ background: s.color }} />

@@ -3,11 +3,21 @@ import { ArenaCanvas } from './components/ArenaCanvas';
 import { RESOURCE_COLORS } from './components/blobColor';
 import { CampInspector } from './components/CampInspector';
 import { ChartsPanel } from './components/ChartsPanel';
-import { ControlsBar, type LiveParams, type SpeedSetting } from './components/ControlsBar';
+import { ControlsBar, CorporateControlsBar, type CorporateParams, type LiveParams, type SpeedSetting } from './components/ControlsBar';
+import { CorporateArena } from './components/CorporateArena';
+import { CorporateChartsPanel } from './components/CorporateChartsPanel';
 import { useAnimationFrame } from './components/useAnimationFrame';
 import { PRESETS } from './engine/config';
+import {
+  CULTURE_PRESETS,
+  CorporateEngine,
+  TRAIT_COLORS,
+  type CultureId,
+  type CorporateStatus,
+  type SavedCorporate,
+} from './engine/CorporateEngine';
 import { SimulationEngine, type SavedSimulation } from './engine/SimulationEngine';
-import type { DayStatus, WorldEvent } from './engine/types';
+import type { DayStatus, GameMode, WorldEvent } from './engine/types';
 import { supabaseConfigured } from './lib/supabase';
 import {
   createWorld,
@@ -22,6 +32,17 @@ import {
 
 const SAVE_KEY = 'blobworld:save:v1';
 const ACTIVE_WORLD_KEY = 'blobworld:active-world';
+const CORPORATE_SAVE_KEY = 'blobworld:corporate:v1';
+const SIM_MODE_KEY = 'blobworld:sim-mode';
+
+type SimMode = 'ecosystem' | 'civilization' | 'corporate';
+const SIM_MODES: { id: SimMode; label: string }[] = [
+  { id: 'ecosystem', label: 'Ecosystem' },
+  { id: 'civilization', label: 'Civilization' },
+  { id: 'corporate', label: 'Corporate Ladder' },
+];
+/** The tribe engine's game mode behind each non-corporate tab. */
+const TRIBE_MODE: Record<Exclude<SimMode, 'corporate'>, GameMode> = { ecosystem: 'lastStanding', civilization: 'endless' };
 
 /** Simulation ticks per second at 1×. */
 const BASE_TPS = 60;
@@ -44,6 +65,17 @@ function paramsFrom(engine: SimulationEngine): LiveParams {
   return { foodPerDay, mutationRate, blobsPerTribe, tribeCount, mode };
 }
 
+function corporateParamsFrom(corp: CorporateEngine): CorporateParams {
+  const { culture, politicsSteepness, layoffPct, espressoPerk } = corp.config;
+  return { culture, politicsSteepness, layoffPct, espressoPerk };
+}
+
+/** A skip-ahead in progress, expressed over whichever engine is active. */
+interface SkipRun {
+  done: () => boolean;
+  progress: () => number;
+}
+
 export default function App() {
   const engineRef = useRef<SimulationEngine | null>(null);
   const restoredDayRef = useRef<number | null>(null);
@@ -64,6 +96,24 @@ export default function App() {
     engineRef.current = eng;
   }
   const engine = engineRef.current;
+
+  const corpRef = useRef<CorporateEngine | null>(null);
+  if (!corpRef.current) {
+    const corp = new CorporateEngine({ seed: randomSeed() });
+    try {
+      const raw = localStorage.getItem(CORPORATE_SAVE_KEY);
+      if (raw) corp.loadJSON(JSON.parse(raw) as SavedCorporate);
+    } catch {
+      // Ignore corrupt saved state.
+    }
+    corpRef.current = corp;
+  }
+  const corp = corpRef.current;
+  const [corporate, setCorporate] = useState(() => localStorage.getItem(SIM_MODE_KEY) === 'corporate');
+  const simMode: SimMode = corporate ? 'corporate' : engine.config.mode === 'lastStanding' ? 'ecosystem' : 'civilization';
+  const [corpParams, setCorpParams] = useState<CorporateParams>(() => corporateParamsFrom(corp));
+  const [corpStatus, setCorpStatus] = useState<CorporateStatus>(() => corp.getStatus());
+  const [corpPinnedId, setCorpPinnedId] = useState<number | null>(null);
 
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<SpeedSetting>(1);
@@ -97,6 +147,14 @@ export default function App() {
     }
     if (worldIdRef.current) queueWorldSave(worldIdRef.current, snapshot);
   }, [engine]);
+
+  const saveCorporate = useCallback(() => {
+    try {
+      localStorage.setItem(CORPORATE_SAVE_KEY, JSON.stringify(corp.toJSON()));
+    } catch {
+      // Ignore quota errors; the company simply restarts next visit.
+    }
+  }, [corp]);
 
   useEffect(() => {
     setCloudErrorReporter((message) => setCloudNote(message));
@@ -150,15 +208,23 @@ export default function App() {
 
   const playingRef = useRef(playing);
   const speedRef = useRef(speed);
+  const corporateRef = useRef(corporate);
   playingRef.current = playing;
   speedRef.current = speed;
+  corporateRef.current = corporate;
 
   const syncUi = useCallback(() => {
-    setRevision(engine.revision);
-    setStatus(engine.getStatus());
-  }, [engine]);
+    if (corporateRef.current) {
+      setRevision(corp.revision);
+      setCorpStatus(corp.getStatus());
+    } else {
+      setRevision(engine.revision);
+      setStatus(engine.getStatus());
+    }
+  }, [engine, corp]);
+  const saveActive = useCallback(() => (corporateRef.current ? saveCorporate() : saveProgress()), [saveCorporate, saveProgress]);
 
-  const skipRef = useRef<{ startDay: number; target: number } | null>(null);
+  const skipRef = useRef<SkipRun | null>(null);
   const [skipProgress, setSkipProgress] = useState<number | null>(null);
   const stopSkip = useCallback(() => {
     skipRef.current = null;
@@ -166,57 +232,61 @@ export default function App() {
   }, []);
 
   // Fixed-timestep driver: simulation rate is decoupled from frame rate, and the
-  // loop is suspended entirely while the tab is hidden.
-  const loop = useRef({ acc: 0, lastStatusAt: 0, lastChartAt: 0, lastRevision: engine.revision });
+  // loop is suspended entirely while the tab is hidden. It steps whichever engine is on screen.
+  const loop = useRef({ acc: 0, lastStatusAt: 0, lastChartAt: 0, lastRevision: -1 });
   useAnimationFrame((now, rawDt) => {
     const l = loop.current;
     const dt = Math.min(100, rawDt);
     const s = speedRef.current;
     const skip = skipRef.current;
+    const isCorp = corporateRef.current;
+    const sim = isCorp ? corp : engine;
 
     if (skip) {
       const deadline = performance.now() + SKIP_FRAME_BUDGET_MS;
-      while (engine.day < skip.target && !engine.finished && performance.now() < deadline) engine.runTicks(25);
-      if (engine.day >= skip.target || engine.finished) {
+      while (!skip.done() && performance.now() < deadline) sim.runTicks(25);
+      if (skip.done()) {
         stopSkip();
-        if (engine.finished) setPlaying(false);
+        if (sim.finished) setPlaying(false);
         syncUi();
-        saveProgress();
+        saveActive();
       } else {
-        const span = Math.max(1, skip.target - skip.startDay);
-        setSkipProgress((engine.day - skip.startDay + engine.tick / engine.config.dayTicks) / span);
+        setSkipProgress(skip.progress());
       }
       l.acc = 0;
     } else if (playingRef.current) {
       if (s === 'max') {
         const deadline = now + MAX_FRAME_BUDGET_MS;
-        for (let done = 0; done < MAX_TICKS_PER_FRAME && !engine.finished; done += 10) {
-          engine.runTicks(10);
+        for (let done = 0; done < MAX_TICKS_PER_FRAME && !sim.finished; done += 10) {
+          sim.runTicks(10);
           if (performance.now() > deadline) break;
         }
       } else {
         l.acc += (dt / 1000) * BASE_TPS * s;
         const n = Math.floor(l.acc);
         l.acc -= n;
-        engine.runTicks(Math.min(n, MAX_TICKS_PER_FRAME));
+        sim.runTicks(Math.min(n, MAX_TICKS_PER_FRAME));
       }
-      if (engine.finished) setPlaying(false);
+      if (sim.finished) setPlaying(false);
     } else {
       l.acc = 0;
     }
 
     const chartInterval = skip ? 300 : s === 'max' ? 120 : 0;
-    if (engine.revision !== l.lastRevision && now - l.lastChartAt >= chartInterval) {
-      l.lastRevision = engine.revision;
+    if (sim.revision !== l.lastRevision && now - l.lastChartAt >= chartInterval) {
+      l.lastRevision = sim.revision;
       l.lastChartAt = now;
-      setRevision(engine.revision);
-      if (!skip && engine.day % 5 === 0 && engine.phase === 'day' && engine.tick === 0) {
+      setRevision(sim.revision);
+      if (isCorp) {
+        if (!skip) saveCorporate();
+      } else if (!skip && engine.day % 5 === 0 && engine.phase === 'day' && engine.tick === 0) {
         saveProgress();
       }
     }
     if (now - l.lastStatusAt > 100) {
       l.lastStatusAt = now;
-      setStatus(engine.getStatus());
+      if (isCorp) setCorpStatus(corp.getStatus());
+      else setStatus(engine.getStatus());
     }
   });
 
@@ -235,50 +305,74 @@ export default function App() {
     [engine],
   );
   const selectFittest = useCallback(() => {
-    setPinnedId(engine.fittestBlob()?.id ?? null);
-  }, [engine]);
+    if (corporateRef.current) setCorpPinnedId(corp.topPerformer()?.id ?? null);
+    else setPinnedId(engine.fittestBlob()?.id ?? null);
+  }, [engine, corp]);
 
   const togglePlay = useCallback(() => {
-    if (engine.finished) return;
+    if (!corporateRef.current && engine.finished) return;
     setPlaying((p) => !p);
   }, [engine]);
 
   const stepDay = useCallback(() => {
     stopSkip();
     setPlaying(false);
-    engine.advanceDay();
+    if (corporateRef.current) corp.advanceQuarter();
+    else engine.advanceDay();
     syncUi();
-    saveProgress();
-  }, [engine, syncUi, saveProgress, stopSkip]);
+    saveActive();
+  }, [engine, corp, syncUi, saveActive, stopSkip]);
 
   const skipYear = useCallback(() => {
     if (skipRef.current) {
       stopSkip();
       syncUi();
-      saveProgress();
+      saveActive();
       return;
     }
-    if (engine.finished) return;
-    skipRef.current = { startDay: engine.day, target: engine.nextYearStartDay };
+    if (corporateRef.current) {
+      const start = corp.quarter;
+      const target = corp.nextFiscalYearQuarter;
+      skipRef.current = {
+        done: () => corp.quarter >= target,
+        progress: () => (corp.quarter - start + corp.quarterTick / corp.config.quarterTicks) / Math.max(1, target - start),
+      };
+    } else {
+      if (engine.finished) return;
+      const start = engine.day;
+      const target = engine.nextYearStartDay;
+      skipRef.current = {
+        done: () => engine.day >= target || engine.finished,
+        progress: () => (engine.day - start + engine.tick / engine.config.dayTicks) / Math.max(1, target - start),
+      };
+    }
     setSkipProgress(0);
-  }, [engine, syncUi, saveProgress, stopSkip]);
+  }, [engine, corp, syncUi, saveActive, stopSkip]);
 
   const reset = useCallback(() => {
     stopSkip();
+    if (corporateRef.current) {
+      corp.reset({ seed: randomSeed() });
+      setCorpPinnedId(null);
+      syncUi();
+      saveCorporate();
+      return;
+    }
     engine.reset({ ...params, seed: randomSeed() });
     setPinnedId(null);
     setSelectedTribeId(null);
     syncUi();
     saveProgress();
-  }, [engine, params, syncUi, saveProgress, stopSkip]);
+  }, [engine, corp, params, syncUi, saveProgress, saveCorporate, stopSkip]);
 
-  const newWorld = useCallback(async () => {
+  const newWorld = useCallback(async (overrides: Partial<LiveParams> = {}) => {
     stopSkip();
     setPlaying(false);
     const previousId = worldIdRef.current;
     const previous = engine.toJSON();
     if (previousId) await saveWorld(previousId, previous);
-    engine.reset({ ...params, seed: randomSeed() });
+    engine.reset({ ...params, ...overrides, seed: randomSeed() });
+    setParams(paramsFrom(engine));
     try {
       const created = await createWorld(engine.toJSON());
       try {
@@ -294,10 +388,63 @@ export default function App() {
       setCloudNote(null);
     } catch (err) {
       engine.loadJSON(previous);
+      setParams(paramsFrom(engine));
       syncUi();
       throw err;
     }
   }, [engine, params, rememberWorld, syncUi, stopSkip]);
+
+  const switchSimMode = useCallback(
+    (next: SimMode) => {
+      if (next === simMode) return;
+      stopSkip();
+      if (next === 'corporate') {
+        corporateRef.current = true;
+        setCorporate(true);
+        localStorage.setItem(SIM_MODE_KEY, 'corporate');
+        syncUi();
+        return;
+      }
+      const mode = TRIBE_MODE[next];
+      if (engine.config.mode !== mode) {
+        // Ecosystem and Civilization are different rule sets, so the switch starts a fresh world.
+        if (supabaseConfigured) {
+          void newWorld({ mode }).catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not start a world'));
+        } else {
+          if (engine.day > 1 && !window.confirm(`Switch to ${next === 'ecosystem' ? 'Ecosystem' : 'Civilization'}? This starts a new tribe world and replaces the current save.`)) return;
+          engine.reset({ ...params, mode, seed: randomSeed() });
+          setParams(paramsFrom(engine));
+          setPinnedId(null);
+          setSelectedTribeId(null);
+          saveProgress();
+        }
+      }
+      corporateRef.current = false;
+      setCorporate(false);
+      localStorage.setItem(SIM_MODE_KEY, next);
+      syncUi();
+    },
+    [simMode, engine, params, newWorld, saveProgress, syncUi, stopSkip],
+  );
+
+  const applyCulture = useCallback(
+    (id: CultureId) => {
+      corp.setConfig({ culture: id });
+      setCorpParams(corporateParamsFrom(corp));
+      setRevision(corp.revision);
+      setCorpStatus(corp.getStatus());
+    },
+    [corp],
+  );
+
+  const setCorpParam = useCallback(
+    <K extends keyof CorporateParams>(key: K, value: CorporateParams[K]) => {
+      corp.setConfig({ [key]: value });
+      setCorpParams(corporateParamsFrom(corp));
+      setRevision(corp.revision);
+    },
+    [corp],
+  );
 
   const switchWorld = useCallback(
     async (id: string) => {
@@ -368,6 +515,8 @@ export default function App() {
         reset();
       } else if (e.key === 'f' || e.key === 'F') {
         selectFittest();
+      } else if (corporateRef.current) {
+        return;
       } else if (e.key === 'v' || e.key === 'V') {
         setViewMode((m) => (m === '2d' ? '3d' : '2d'));
       } else if (e.key === 'd' || e.key === 'D') {
@@ -398,200 +547,306 @@ export default function App() {
         <div>
           <h1 className="text-[19px] font-semibold tracking-tight text-ink-200">
             Blob<span className="text-ink-400">World</span>
-            <span className="ml-2 text-[12px] font-medium text-ink-500">Tribes</span>
+            <span className="ml-2 text-[12px] font-medium text-ink-500">{corporate ? 'BlobCorp' : 'Tribes'}</span>
           </h1>
           <p className="text-[11.5px] text-ink-500">
-            {engine.config.mode === 'endless'
-              ? 'Tribes gather, build and raid through the seasons. Crowded camps split, ruins are resettled, and brains keep evolving.'
-              : 'Rival tribes gather, build and raid through summer, fall and winter. Each brain evolves to help its tribe outlast the rest.'}
+            {corporate
+              ? 'Employees ship, network and scheme up a six-floor tower. Every floor rewards a different mix of output, visibility and politics; the best climb, the worst are cut, and most new hires are cloned from leadership.'
+              : engine.config.mode === 'endless'
+                ? 'Tribes gather, build and raid through the seasons. Crowded camps split, ruins are resettled, and brains keep evolving.'
+                : 'Rival tribes gather, build and raid through summer, fall and winter. Each brain evolves to help its tribe outlast the rest.'}
           </p>
         </div>
+        <nav className="flex rounded-full border border-ink-700/80 bg-ink-900/70 p-0.5" aria-label="Simulation mode">
+          {SIM_MODES.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => switchSimMode(m.id)}
+              aria-pressed={simMode === m.id}
+              className={`rounded-full px-3.5 py-1 text-[12px] font-medium transition ${
+                simMode === m.id ? 'bg-ink-200 text-ink-950' : 'text-ink-400 hover:text-ink-200'
+              }`}
+            >
+              {m.label}
+            </button>
+          ))}
+        </nav>
         <div className="flex items-center gap-4 text-[10.5px] text-ink-500">
-          <span className="flex max-w-[520px] flex-wrap items-center justify-end gap-x-3 gap-y-1">
-            {(engine.config.mode === 'endless' ? living : status.tribes).map((t) => (
-              <span key={t.id} className={`flex items-center gap-1.5 ${t.extinct ? 'opacity-40 line-through' : ''}`}>
-                <span className="h-2 w-2 rounded-full" style={{ background: t.color }} />
-                <span style={{ color: t.color }}>{t.name}</span>
-              </span>
-            ))}
-          </span>
-          <span className="font-mono">seed {engine.config.seed}</span>
+          {corporate ? (
+            <span className="flex items-center gap-3">
+              <span style={{ color: TRAIT_COLORS.execution }}>● Execution</span>
+              <span style={{ color: TRAIT_COLORS.charisma }}>● Charisma</span>
+              <span style={{ color: TRAIT_COLORS.politics }}>● Politics</span>
+            </span>
+          ) : (
+            <span className="flex max-w-[520px] flex-wrap items-center justify-end gap-x-3 gap-y-1">
+              {(engine.config.mode === 'endless' ? living : status.tribes).map((t) => (
+                <span key={t.id} className={`flex items-center gap-1.5 ${t.extinct ? 'opacity-40 line-through' : ''}`}>
+                  <span className="h-2 w-2 rounded-full" style={{ background: t.color }} />
+                  <span style={{ color: t.color }}>{t.name}</span>
+                </span>
+              ))}
+            </span>
+          )}
+          <span className="font-mono">seed {corporate ? corp.config.seed : engine.config.seed}</span>
         </div>
       </header>
 
-      <ControlsBar
-        playing={playing}
-        speed={speed}
-        params={params}
-        pending={pending}
-        presets={PRESETS}
-        activePreset={activePreset}
-        onTogglePlay={togglePlay}
-        onStepDay={stepDay}
-        onSkipYear={skipYear}
-        skipProgress={skipProgress}
-        nextYear={status.year + 1}
-        onSpeed={setSpeed}
-        onParam={setParam}
-        onPreset={applyPreset}
-        onReset={reset}
-        onSave={saveProgress}
-        savedLabel={cloudNote ?? savedLabel}
-        worlds={worlds}
-        activeWorldId={activeWorldId}
-        onNewWorld={supabaseConfigured ? () => void newWorld().catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not start a world')) : undefined}
-        onSwitchWorld={supabaseConfigured ? (id) => void switchWorld(id).catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not open that world')) : undefined}
-        onSelectFittest={selectFittest}
-      />
+      {corporate ? (
+        <>
+          <CorporateControlsBar
+            playing={playing}
+            speed={speed}
+            params={corpParams}
+            presets={CULTURE_PRESETS}
+            skipProgress={skipProgress}
+            nextFiscalYear={corpStatus.fiscalYear + 1}
+            onTogglePlay={togglePlay}
+            onStepQuarter={stepDay}
+            onSkipYear={skipYear}
+            onSpeed={setSpeed}
+            onParam={setCorpParam}
+            onPreset={applyCulture}
+            onReset={reset}
+            onSelectTop={selectFittest}
+          />
+          <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_460px]">
+            <section className="flex min-h-[420px] flex-col rounded-xl border border-ink-700/60 bg-ink-900/40 p-3">
+              <QuarterProgress status={corpStatus} />
+              <div className="relative mt-3 min-h-0 flex-1">
+                <CorporateArena engine={corp} pinnedId={corpPinnedId} onPinnedChange={setCorpPinnedId} />
+              </div>
+              <footer className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 px-1 text-[10.5px] text-ink-500">
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-sm bg-[#4fe3f0]/60" /> workstations: energy → KPI + burnout
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-sm bg-[#ffb347]/60" /> breakroom: energy back, burnout down
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-sm bg-[#ff5fd2]/60" /> watercooler: visibility, alliances, credit-stealing
+                </span>
+                <span>lanyard junior · headphones senior · tie manager · blazer director · pin VP · crown C-Suite · ★ greenfield launch</span>
+                <span className="ml-auto">Scroll to zoom · drag to pan · Space play · → next review · Y next FY · R reset · F top performer</span>
+              </footer>
+            </section>
+            <aside className="min-h-0 overflow-y-auto pr-0.5">
+              <CorporateChartsPanel engine={corp} status={corpStatus} revision={revision} />
+            </aside>
+          </main>
+        </>
+      ) : (
+          <>
+          <ControlsBar
+            playing={playing}
+            speed={speed}
+            params={params}
+            pending={pending}
+            presets={PRESETS}
+            activePreset={activePreset}
+            onTogglePlay={togglePlay}
+            onStepDay={stepDay}
+            onSkipYear={skipYear}
+            skipProgress={skipProgress}
+            nextYear={status.year + 1}
+            onSpeed={setSpeed}
+            onParam={setParam}
+            onPreset={applyPreset}
+            onReset={reset}
+            onSave={saveProgress}
+            savedLabel={cloudNote ?? savedLabel}
+            worlds={worlds}
+            activeWorldId={activeWorldId}
+            onNewWorld={supabaseConfigured ? () => void newWorld().catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not start a world')) : undefined}
+            onSwitchWorld={supabaseConfigured ? (id) => void switchWorld(id).catch((err) => setCloudNote(err instanceof Error ? err.message : 'Could not open that world')) : undefined}
+            onSelectFittest={selectFittest}
+          />
 
-      <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_460px]">
-        <section className="flex min-h-[420px] flex-col rounded-xl border border-ink-700/60 bg-ink-900/40 p-3">
-          <DayProgress status={status} graceDays={engine.config.graceDays} />
-          <div className="relative mt-3 min-h-0 flex-1">
-            {viewMode === '2d' ? (
-              <ArenaCanvas
-                engine={engine}
-                pinnedId={pinnedId}
-                onPinnedChange={setPinnedId}
-                selectedTribeId={selectedTribeId}
-                onSelectTribe={setSelectedTribeId}
-                focusTarget={focusTarget}
-                directorMode={directorMode}
-              />
-            ) : (
-              <Suspense fallback={<div className="flex h-full items-center justify-center text-[12px] text-ink-500">Loading 3D world…</div>}>
-                <World3D
-                  engine={engine}
-                  pinnedId={pinnedId}
-                  onPinnedChange={setPinnedId}
-                  selectedTribeId={selectedTribeId}
-                  onSelectTribe={setSelectedTribeId}
-                  focusTarget={focusTarget}
-                  directorMode={directorMode}
-                />
-              </Suspense>
-            )}
-            {selectedTribeId !== null && (
-              <CampInspector
-                engine={engine}
-                tribeId={selectedTribeId}
-                onClose={() => setSelectedTribeId(null)}
-                onAction={syncUi}
-              />
-            )}
-            <div className="absolute top-2 left-2 z-20 flex items-center gap-1.5">
-              <div className="flex rounded-full border border-ink-700/80 bg-ink-900/80 p-0.5 backdrop-blur">
-                {(['2d', '3d'] as const).map((m) => (
+          <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_460px]">
+            <section className="flex min-h-[420px] flex-col rounded-xl border border-ink-700/60 bg-ink-900/40 p-3">
+              <DayProgress status={status} graceDays={engine.config.graceDays} />
+              <div className="relative mt-3 min-h-0 flex-1">
+                {viewMode === '2d' ? (
+                  <ArenaCanvas
+                    engine={engine}
+                    pinnedId={pinnedId}
+                    onPinnedChange={setPinnedId}
+                    selectedTribeId={selectedTribeId}
+                    onSelectTribe={setSelectedTribeId}
+                    focusTarget={focusTarget}
+                    directorMode={directorMode}
+                  />
+                ) : (
+                  <Suspense fallback={<div className="flex h-full items-center justify-center text-[12px] text-ink-500">Loading 3D world…</div>}>
+                    <World3D
+                      engine={engine}
+                      pinnedId={pinnedId}
+                      onPinnedChange={setPinnedId}
+                      selectedTribeId={selectedTribeId}
+                      onSelectTribe={setSelectedTribeId}
+                      focusTarget={focusTarget}
+                      directorMode={directorMode}
+                    />
+                  </Suspense>
+                )}
+                {selectedTribeId !== null && (
+                  <CampInspector
+                    engine={engine}
+                    tribeId={selectedTribeId}
+                    onClose={() => setSelectedTribeId(null)}
+                    onAction={syncUi}
+                  />
+                )}
+                <div className="absolute top-2 left-2 z-20 flex items-center gap-1.5">
+                  <div className="flex rounded-full border border-ink-700/80 bg-ink-900/80 p-0.5 backdrop-blur">
+                    {(['2d', '3d'] as const).map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => setViewMode(m)}
+                        title="Switch view (V)"
+                        className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium uppercase transition ${
+                          viewMode === m ? 'bg-ink-700 text-ink-200' : 'text-ink-500 hover:text-ink-300'
+                        }`}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
                   <button
-                    key={m}
                     type="button"
-                    onClick={() => setViewMode(m)}
-                    title="Switch view (V)"
-                    className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium uppercase transition ${
-                      viewMode === m ? 'bg-ink-700 text-ink-200' : 'text-ink-500 hover:text-ink-300'
+                    onClick={() => setDirectorMode((d) => !d)}
+                    title="Director camera: auto-follow wars, splits & festivals (D)"
+                    className={`rounded-full border px-2.5 py-1 text-[11px] font-medium backdrop-blur transition ${
+                      directorMode
+                        ? 'border-amber-400/60 bg-amber-400/20 text-amber-200'
+                        : 'border-ink-700/80 bg-ink-900/80 text-ink-400 hover:text-ink-200'
                     }`}
                   >
-                    {m}
-                  </button>
-                ))}
-              </div>
-              <button
-                type="button"
-                onClick={() => setDirectorMode((d) => !d)}
-                title="Director camera: auto-follow wars, splits & festivals (D)"
-                className={`rounded-full border px-2.5 py-1 text-[11px] font-medium backdrop-blur transition ${
-                  directorMode
-                    ? 'border-amber-400/60 bg-amber-400/20 text-amber-200'
-                    : 'border-ink-700/80 bg-ink-900/80 text-ink-400 hover:text-ink-200'
-                }`}
-              >
-                Director
-              </button>
-            </div>
-            {engine.events.length > 0 && (
-              <div className="pointer-events-none absolute top-11 left-2 z-10 flex max-w-[300px] flex-col gap-1">
-                {engine.events
-                  .slice(-2)
-                  .reverse()
-                  .map((ev, i) => {
-                    const t = engine.tribes[ev.tribeId];
-                    return (
-                      <button
-                        key={`${ev.day}-${ev.kind}-${i}`}
-                        type="button"
-                        onClick={() => focusCamp(ev.tribeId)}
-                        className="pointer-events-auto flex items-center gap-1.5 rounded-lg border border-ink-700/70 bg-ink-900/80 px-2.5 py-1 text-left text-[10.5px] text-ink-200 shadow backdrop-blur transition hover:border-ink-500"
-                        style={{ opacity: i === 0 ? 0.95 : 0.72 }}
-                        title="Jump camera to camp"
-                      >
-                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: t?.color ?? '#c8d0df' }} />
-                        <span className="truncate">{ev.text}</span>
-                        <span className="ml-auto shrink-0 font-mono text-[9.5px] text-ink-500">d{ev.day}</span>
-                      </button>
-                    );
-                  })}
-              </div>
-            )}
-            <DiscoveryCard engine={engine} day={status.day} onFocus={focusCamp} />
-            {(status.phase === 'extinct' || status.phase === 'won') && (
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div className="min-w-[280px] rounded-xl border border-ink-600/70 bg-ink-900/90 px-6 py-5 text-center shadow-2xl backdrop-blur">
-                  <EndSummary status={status} />
-                  <button
-                    type="button"
-                    onClick={reset}
-                    className="mt-4 rounded-full bg-ink-200 px-4 py-1.5 text-[12px] font-medium text-ink-950 hover:bg-white"
-                  >
-                    Start over
+                    Director
                   </button>
                 </div>
+                {engine.events.length > 0 && (
+                  <div className="pointer-events-none absolute top-11 left-2 z-10 flex max-w-[300px] flex-col gap-1">
+                    {engine.events
+                      .slice(-2)
+                      .reverse()
+                      .map((ev, i) => {
+                        const t = engine.tribes[ev.tribeId];
+                        return (
+                          <button
+                            key={`${ev.day}-${ev.kind}-${i}`}
+                            type="button"
+                            onClick={() => focusCamp(ev.tribeId)}
+                            className="pointer-events-auto flex items-center gap-1.5 rounded-lg border border-ink-700/70 bg-ink-900/80 px-2.5 py-1 text-left text-[10.5px] text-ink-200 shadow backdrop-blur transition hover:border-ink-500"
+                            style={{ opacity: i === 0 ? 0.95 : 0.72 }}
+                            title="Jump camera to camp"
+                          >
+                            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: t?.color ?? '#c8d0df' }} />
+                            <span className="truncate">{ev.text}</span>
+                            <span className="ml-auto shrink-0 font-mono text-[9.5px] text-ink-500">d{ev.day}</span>
+                          </button>
+                        );
+                      })}
+                  </div>
+                )}
+                <DiscoveryCard engine={engine} day={status.day} onFocus={focusCamp} />
+                {(status.phase === 'extinct' || status.phase === 'won') && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="min-w-[280px] rounded-xl border border-ink-600/70 bg-ink-900/90 px-6 py-5 text-center shadow-2xl backdrop-blur">
+                      <EndSummary status={status} />
+                      <button
+                        type="button"
+                        onClick={reset}
+                        className="mt-4 rounded-full bg-ink-200 px-4 py-1.5 text-[12px] font-medium text-ink-950 hover:bg-white"
+                      >
+                        Start over
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-          <footer className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 px-1 text-[10.5px] text-ink-500">
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full" style={{ background: RESOURCE_COLORS.food }} /> berries
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-[#8ce0ff]" /> fish
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rotate-45" style={{ background: '#2f6b47' }} /> trees
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-sm" style={{ background: RESOURCE_COLORS.stone }} /> stone
-            </span>
-            <span>Carry to your Town Hall · camps evolve into modern cities with factories, power grids, labs, hospitals, skyscrapers & highways</span>
-            <span className="flex items-center gap-2">
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#e6c37a]" /> forager</span>
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#4ca968]" /> woodcutter</span>
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#6e9be6]" /> miner</span>
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#f5c451]" /> builder</span>
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#ff6b6b]" /> soldier</span>
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#d4a373]" /> carrier</span>
-              <span><span className="inline-block h-2 w-2 rounded-full bg-[#5fe0e0]" /> scout</span>
-            </span>
-            <span className="ml-auto">
-              {viewMode === '2d' ? 'Scroll to zoom · drag to pan · ' : ''}Space play · → step · Y next year · R reset · F fittest · V 2D/3D · D director
-            </span>
-          </footer>
-        </section>
+              <footer className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 px-1 text-[10.5px] text-ink-500">
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full" style={{ background: RESOURCE_COLORS.food }} /> berries
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-[#8ce0ff]" /> fish
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rotate-45" style={{ background: '#2f6b47' }} /> trees
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-sm" style={{ background: RESOURCE_COLORS.stone }} /> stone
+                </span>
+                <span>Carry to your Town Hall · camps evolve into modern cities with factories, power grids, labs, hospitals, skyscrapers & highways</span>
+                <span className="flex items-center gap-2">
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#e6c37a]" /> forager</span>
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#4ca968]" /> woodcutter</span>
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#6e9be6]" /> miner</span>
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#f5c451]" /> builder</span>
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#ff6b6b]" /> soldier</span>
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#d4a373]" /> carrier</span>
+                  <span><span className="inline-block h-2 w-2 rounded-full bg-[#5fe0e0]" /> scout</span>
+                </span>
+                <span className="ml-auto">
+                  {viewMode === '2d' ? 'Scroll to zoom · drag to pan · ' : ''}Space play · → step · Y next year · R reset · F fittest · V 2D/3D · D director
+                </span>
+              </footer>
+            </section>
 
-        <aside className="min-h-0 overflow-y-auto pr-0.5">
-          <ChartsPanel
-            history={engine.history}
-            genes={engine.generationGenes}
-            tribes={engine.tribes}
-            realms={engine.realms}
-            winters={engine.winters}
-            events={engine.events}
-            status={status}
-            selectedTribeId={selectedTribeId}
-            onSelectTribe={setSelectedTribeId}
-            revision={revision}
-          />
-        </aside>
-      </main>
+            <aside className="min-h-0 overflow-y-auto pr-0.5">
+              <ChartsPanel
+                history={engine.history}
+                genes={engine.generationGenes}
+                tribes={engine.tribes}
+                realms={engine.realms}
+                winters={engine.winters}
+                events={engine.events}
+                status={status}
+                selectedTribeId={selectedTribeId}
+                onSelectTribe={setSelectedTribeId}
+                revision={revision}
+              />
+            </aside>
+          </main>
+          </>
+      )}
+    </div>
+  );
+}
+
+function QuarterProgress({ status }: { status: CorporateStatus }) {
+  const { activity, headcount } = status;
+  const total = headcount || 1;
+  return (
+    <div className="px-1">
+      <div className="mb-1.5 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[11px]">
+        <span className="text-[13px] font-semibold text-ink-200">
+          FY{status.fiscalYear} · Q{status.quarterOfYear} · Week {status.week}
+        </span>
+        <span className="text-ink-500">
+          {status.week >= 12 ? 'performance reviews imminent' : status.week <= 2 ? 'fresh quarter · new OKRs' : 'heads down, shipping'}
+        </span>
+        <span className="font-mono text-ink-400 tabular-nums">
+          QTD revenue <span className="text-[#6fe39a]">{Math.round(status.revenueQtd)}</span> · visibility{' '}
+          <span className="text-[#ff5fd2]">{Math.round(status.visibilityQtd)}</span> · political credit{' '}
+          <span className="text-[#ffb347]">{Math.round(status.politicalQtd)}</span> · medical leave{' '}
+          <span className="text-[#ff6b6b]">{status.medicalQtd}</span>
+        </span>
+        <span className="ml-auto font-mono text-ink-300 tabular-nums">
+          {headcount} <span className="text-ink-500">employees</span>
+        </span>
+      </div>
+      <div className="flex h-1.5 overflow-hidden rounded-full bg-ink-700/70" title="What everyone is doing right now">
+        <div className="h-full bg-[#4fe3f0]/80" style={{ width: `${(activity.work / total) * 100}%` }} />
+        <div className="h-full bg-[#ffb347]/80" style={{ width: `${(activity.break / total) * 100}%` }} />
+        <div className="h-full bg-[#ff5fd2]/80" style={{ width: `${(activity.network / total) * 100}%` }} />
+      </div>
+      <div className="mt-1 h-0.5 overflow-hidden rounded-full bg-ink-800">
+        <div className="h-full bg-[#f5c451]/70" style={{ width: `${status.quarterProgress * 100}%` }} />
+      </div>
     </div>
   );
 }

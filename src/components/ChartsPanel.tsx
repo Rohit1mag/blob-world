@@ -45,7 +45,7 @@ interface ChartsPanelProps {
   revision: number;
 }
 
-function Card({ title, subtitle, legend, children }: { title: ReactNode; subtitle?: string; legend?: ReactNode; children: ReactNode }) {
+export function Card({ title, subtitle, legend, children }: { title: ReactNode; subtitle?: string; legend?: ReactNode; children: ReactNode }) {
   return (
     <section className="rounded-xl border border-ink-700/60 bg-ink-900/70 px-4 pt-3 pb-3">
       <header className="mb-2 flex items-start justify-between gap-3">
@@ -60,7 +60,7 @@ function Card({ title, subtitle, legend, children }: { title: ReactNode; subtitl
   );
 }
 
-function LegendItem({ color, label, value, dashed }: { color: string; label: string; value?: string; dashed?: boolean }) {
+export function LegendItem({ color, label, value, dashed }: { color: string; label: string; value?: string; dashed?: boolean }) {
   return (
     <span className="flex items-center gap-1.5 text-ink-400">
       <span
@@ -73,7 +73,7 @@ function LegendItem({ color, label, value, dashed }: { color: string; label: str
   );
 }
 
-function Stat({ label, value, tone }: { label: string; value: ReactNode; tone?: string }) {
+export function Stat({ label, value, tone }: { label: string; value: ReactNode; tone?: string }) {
   return (
     <div className="flex flex-col">
       <span className="text-[9.5px] font-medium tracking-wider text-ink-500 uppercase">{label}</span>

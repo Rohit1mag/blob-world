@@ -29,6 +29,21 @@ function coopLabel(v: number): string {
   return 'gather';
 }
 
+const signed = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`;
+
+function tribeOutputs(out: Float32Array): string[] {
+  return [signed(out[0]), `${Math.round(((out[1] + 1) / 2) * 100)}%`, `${signed(out[2])} ${coopLabel(out[2])}`];
+}
+
+export interface BrainLabels {
+  inputs: readonly string[];
+  outputs: readonly string[];
+  /** Readout text shown under each output neuron. */
+  format: (out: Float32Array) => string[];
+}
+
+const TRIBE_LABELS: BrainLabels = { inputs: INPUT_LABELS, outputs: OUTPUT_LABELS, format: tribeOutputs };
+
 interface Synapse {
   x1: number;
   y1: number;
@@ -45,7 +60,7 @@ interface Synapse {
  * render through React (they only change when a different blob is selected); activations
  * are pushed straight to the DOM every frame.
  */
-export function BrainVisualizer({ net }: { net: NeuralNet }) {
+export function BrainVisualizer({ net, labels = TRIBE_LABELS }: { net: NeuralNet; labels?: BrainLabels }) {
   const { inputs: nIn, hidden: nHid, outputs: nOut } = net.shape;
   const height = Math.round(nIn * ROW + TOP * 2);
 
@@ -77,11 +92,11 @@ export function BrainVisualizer({ net }: { net: NeuralNet }) {
     for (let i = 0; i < nIn; i++) inRefs.current[i]?.setAttribute('fill', activationFill(net.input[i]));
     for (let h = 0; h < nHid; h++) hidRefs.current[h]?.setAttribute('fill', activationFill(net.hidden[h]));
     for (let o = 0; o < nOut; o++) outRefs.current[o]?.setAttribute('fill', activationFill(net.output[o]));
-    const [turn, throttle, coop] = outText.current;
-    const out = net.output;
-    if (turn) turn.textContent = `${out[0] >= 0 ? '+' : ''}${out[0].toFixed(2)}`;
-    if (throttle) throttle.textContent = `${Math.round(((out[1] + 1) / 2) * 100)}%`;
-    if (coop) coop.textContent = `${out[2] >= 0 ? '+' : ''}${out[2].toFixed(2)} ${coopLabel(out[2])}`;
+    const readouts = labels.format(net.output);
+    for (let o = 0; o < nOut; o++) {
+      const el = outText.current[o];
+      if (el) el.textContent = readouts[o] ?? '';
+    }
     const { synapses } = layout;
     for (let k = 0; k < synapses.length; k++) {
       const s = synapses[k];
@@ -112,7 +127,7 @@ export function BrainVisualizer({ net }: { net: NeuralNet }) {
       {layout.yIn.map((y, i) => (
         <g key={`i${i}`}>
           <text x={X_IN - 7} y={y} dy="0.32em" textAnchor="end" className="fill-ink-400 font-mono text-[7px]">
-            {INPUT_LABELS[i] ?? `in ${i}`}
+            {labels.inputs[i] ?? `in ${i}`}
           </text>
           <circle ref={(el) => void (inRefs.current[i] = el)} cx={X_IN} cy={y} r={3.4} stroke="#55617c" strokeWidth={0.6} />
         </g>
@@ -132,7 +147,7 @@ export function BrainVisualizer({ net }: { net: NeuralNet }) {
         <g key={`o${o}`}>
           <circle ref={(el) => void (outRefs.current[o] = el)} cx={X_OUT} cy={y} r={5.5} stroke="#7d89a3" strokeWidth={0.8} />
           <text x={X_OUT + 9} y={y - 4} className="fill-ink-400 font-mono text-[7.5px]">
-            {OUTPUT_LABELS[o] ?? `out ${o}`}
+            {labels.outputs[o] ?? `out ${o}`}
           </text>
           <text ref={(el) => void (outText.current[o] = el)} x={X_OUT + 9} y={y + 6} className="fill-ink-200 font-mono text-[8px]" />
         </g>
